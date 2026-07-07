@@ -295,6 +295,7 @@ LANG = {
         "tab_style": "Style",
         "tab_presets": "Presets",
         "tab_setup": "Setup",
+        "tab_shapr": "TextShapR",
         "close": "Close",
         "preset_actions": "Preset actions (save, delete, import, export)",
         "outline_more": "Outline settings …",
@@ -699,6 +700,7 @@ LANG = {
         "tab_style": "Stil",
         "tab_presets": "Presets",
         "tab_setup": "Einstellungen",
+        "tab_shapr": "TextShapR",
         "close": "Schließen",
         "preset_actions": "Preset-Aktionen (speichern, löschen, importieren, exportieren)",
         "outline_more": "Kontur-Einstellungen …",
@@ -2301,23 +2303,23 @@ class ShapeCard(QFrame):
         p.end()
 
 
-class TextShapRDialog(QDialog):
-    """Modal picker: shows the current line wrapped into several candidate
-    shapes (mode bar: Balanced / Round / Tall / Wide, plus a Hyphenation
-    toggle) as numbered thumbnails. Click selects; Apply inserts the chosen
-    arrangement through the normal insert path; Apply + next also advances.
-    Number keys select a card, Shift+number applies and advances."""
+class TextShapRWidget(QWidget):
+    """TextShapR picker as its own docker tab: shows the current line wrapped
+    into several candidate shapes (mode bar: Balanced / Round / Tall / Wide,
+    plus a Hyphenation toggle) as numbered thumbnails that reflow to the docker
+    width. Click selects; Apply inserts the chosen arrangement through the
+    normal insert path; Apply + next also advances. Number keys select a card,
+    Shift+number applies and advances."""
 
     _MODES = ("balanced", "round", "tall", "wide")
 
     def __init__(self, docker):
-        super().__init__(docker.widget())
+        super().__init__()
         self._docker = docker
         t = docker._tr
-        self.setWindowTitle(t("shaper_title"))
-        self.resize(470, 620)
 
         lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
         self.setLayout(lay)
 
         bar = QHBoxLayout()
@@ -2330,29 +2332,30 @@ class TextShapRDialog(QDialog):
                 b.setChecked(True)
             self._mode_group.addButton(b, i)
             bar.addWidget(b)
-        self._mode_group.buttonClicked.connect(lambda *_a: self._refresh())
+        self._mode_group.buttonClicked.connect(lambda *_a: self.refresh())
         # hyphenation is a toggle on top of the mode, not exclusive with it
         self.hyph_btn = QPushButton(t("shaper_hyph"))
         self.hyph_btn.setCheckable(True)
         self.hyph_btn.setChecked(docker.hyph_chk.isChecked())
-        self.hyph_btn.toggled.connect(lambda *_a: self._refresh())
+        self.hyph_btn.toggled.connect(lambda *_a: self.refresh())
         bar.addWidget(self.hyph_btn)
         lay.addLayout(bar)
 
+        self._empty = QLabel(t("shaper_empty"))
+        self._empty.setWordWrap(True)
+        self._empty.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._empty)
+
+        # The thumbnails reflow to the available width, so their rows follow the
+        # docker size (a wider docker fits more cards per row).
         self._grid_host = QWidget()
-        self._grid = QGridLayout()
-        self._grid.setSpacing(8)
-        self._grid_host.setLayout(self._grid)
+        self._flow = FlowLayout(margin=0, spacing=8)
+        self._grid_host.setLayout(self._flow)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.StyledPanel)
         scroll.setWidget(self._grid_host)
         lay.addWidget(scroll, 1)
-
-        self._empty = QLabel(t("shaper_empty"))
-        self._empty.setWordWrap(True)
-        self._empty.setAlignment(Qt.AlignCenter)
-        self._grid.addWidget(self._empty, 0, 0, 1, 2)
 
         self._hint = QLabel(t("shaper_hint"))
         self._hint.setStyleSheet("color: gray;")
@@ -2368,15 +2371,18 @@ class TextShapRDialog(QDialog):
         self.apply_next_btn.setDefault(True)
         self.apply_next_btn.clicked.connect(lambda: self._apply(True))
         foot.addWidget(self.apply_next_btn)
-        self.close_btn = QPushButton(t("close"))
-        self.close_btn.clicked.connect(self.reject)
-        foot.addWidget(self.close_btn)
         lay.addLayout(foot)
 
         self._cards = []
         self._cands = []
         self._sel = -1
-        self._refresh()
+        self.refresh()
+
+    def showEvent(self, ev):
+        # Refresh when the tab becomes visible: the current line, selection or
+        # style may have changed while another tab was in front.
+        super().showEvent(ev)
+        self.refresh()
 
     # -- data --
 
@@ -2418,12 +2424,15 @@ class TextShapRDialog(QDialog):
             "shadow_dy": float(d.shadow_y_spin.value()),
         }
 
-    def _refresh(self):
+    def refresh(self):
         """Regenerate the candidates for the current line and rebuild the
         cards. Never raises; with no font/text it shows a hint instead."""
+        if not hasattr(self._docker, "font_picker"):
+            return
         d = self._docker
         for card in self._cards:
-            self._grid.removeWidget(card)
+            self._flow.removeWidget(card)
+            card.setParent(None)
             card.deleteLater()
         self._cards = []
         self._cands = []
@@ -2466,7 +2475,7 @@ class TextShapRDialog(QDialog):
         for i, cand in enumerate(self._cands):
             card = ShapeCard(i, cand, o, scale)
             card.clicked.connect(self._select)
-            self._grid.addWidget(card, i // 2, i % 2)
+            self._flow.addWidget(card)
             self._cards.append(card)
         self._select(0)
 
@@ -2484,7 +2493,7 @@ class TextShapRDialog(QDialog):
             return
         ok = self._docker.insert_arrangement(self._cands[self._sel], advance)
         if ok and advance:
-            self._refresh()        # show the shapes for the next line
+            self.refresh()        # show the shapes for the next line
 
     @staticmethod
     def _digit(event):
@@ -2908,6 +2917,7 @@ class TyperDocker(DockWidget):
         lay_type = _page()       # everyday insert loop
         lay_style = _page()      # font variants, alignment, effects, fitting
         lay_setup = _page()      # language + panel layout
+        lay_shapr = _page()      # TextShapR: pick a shape arrangement
 
         # Presets are no longer their own tab: they live inside the Type
         # tab as a self-contained panel container. Building them into this
@@ -3298,9 +3308,6 @@ class TyperDocker(DockWidget):
         self.insert_btn = QPushButton()
         self.insert_btn.clicked.connect(self.on_insert)
         insert_row.addWidget(self.insert_btn, 1)
-        self.shaper_btn = QPushButton()
-        self.shaper_btn.clicked.connect(self.on_open_shaper)
-        insert_row.addWidget(self.shaper_btn)
         _insl.addLayout(insert_row)
         lay_type.addWidget(_ins_pb)
 
@@ -3477,6 +3484,10 @@ class TyperDocker(DockWidget):
         lay_style.addWidget(_hy_pb)
         lay_style.addStretch(1)
 
+        # --- TextShapR tab (pick a shape arrangement for the current line) ---
+        self.shapr_widget = TextShapRWidget(self)
+        lay_shapr.addWidget(self.shapr_widget)
+
         # status line below the tabs, always visible
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -3490,7 +3501,7 @@ class TyperDocker(DockWidget):
         # order are persisted; the panel-level drag/detach comes in a later
         # phase and builds on layoutmodel.py.
         self._tab_defaults = [("type", "tab_type"), ("style", "tab_style"),
-                              ("setup", "tab_setup")]
+                              ("setup", "tab_setup"), ("shapr", "tab_shapr")]
         self._tab_pages = {}          # id -> tab page widget (kept when hidden)
         for i, (tid, _nk) in enumerate(self._tab_defaults):
             self.main_tabs.tabBar().setTabData(i, tid)
@@ -3858,8 +3869,6 @@ class TyperDocker(DockWidget):
             self.hyph_lang_combo.setItemText(
                 i, t("hyph_auto" if code == "auto" else "hyph_" + str(code)))
         self.insert_btn.setText(t("insert_btn"))
-        self.shaper_btn.setText(t("shaper_btn"))
-        self.shaper_btn.setToolTip(t("shaper_btn_tip"))
         self.replace_chk.setText(t("replace_existing"))
         self.replace_chk.setToolTip(t("replace_existing_tip"))
         self.by_char_chk.setText(t("presets_by_char"))
@@ -4463,9 +4472,16 @@ class TyperDocker(DockWidget):
         return None
 
     def _on_enable_shapr(self, on, save=True):
-        """Show or hide the TextShapR button on the Type tab."""
-        if hasattr(self, "shaper_btn"):
-            self.shaper_btn.setVisible(bool(on))
+        """Show or hide the TextShapR tab. The page widget is kept alive when
+        hidden so its state survives re-enabling."""
+        idx = self._tab_index_of("shapr")
+        if on and idx is None:
+            page = self._tab_pages.get("shapr")
+            if page is not None:
+                i = self.main_tabs.addTab(page, self._tab_label("shapr"))
+                self.main_tabs.tabBar().setTabData(i, "shapr")
+        elif not on and idx is not None:
+            self.main_tabs.removeTab(idx)
         if save:
             Krita.instance().writeSetting(
                 "typer_perf", "enableShapr", "true" if on else "false")
@@ -5602,11 +5618,6 @@ class TyperDocker(DockWidget):
         if fmt.get("replaced"):
             msg += "  " + self._tr("st_replaced")
         return msg
-
-    def on_open_shaper(self):
-        """Open the TextShapR picker for the current line."""
-        dlg = TextShapRDialog(self)
-        dlg.exec_()
 
     def insert_arrangement(self, cand, advance):
         """Insert a TextShapR candidate through the normal insert path. The
