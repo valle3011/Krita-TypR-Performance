@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# internal dev notes — not part of the public release
+PROMPT_performance.md
+README_original.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp

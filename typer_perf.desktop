@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=typer_perf
+X-Python-2-Compatible=false
+X-Krita-Manual=Manual.html
+Name=TypeR Performance (test)
+Comment=Performance test build of TypeR for weak PCs: debounced/cached preview and a Lite mode. Installs alongside the normal TypeR.

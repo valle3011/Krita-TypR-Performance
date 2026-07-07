@@ -1,0 +1,5725 @@
+# -*- coding: utf-8 -*-
+"""
+TypeR for Krita
+===============
+
+A Krita docker that recreates the core of the Photoshop plugin "TypeR" as far
+as Krita's API allows:
+
+  * Read translation scripts from Word (.docx), OpenOffice/LibreOffice (.odt)
+    as well as .txt / .md
+  * Split the text line by line, with one line active at a time
+  * Navigate back / forward through the lines, preview the active line
+  * Detect "Page" markers in the script so you always know which page you are
+    on and can jump straight to a given page
+  * Optionally skip empty lines
+  * Insert the active line as a text layer in Krita (optionally centered on the
+    current selection), with font, size and color
+
+Important: the reader parses .docx / .odt correctly as ZIP-of-XML rather than
+as plain text. That avoids any "character could not be read" error. Only
+modules from the Python standard library are used (zipfile, xml.etree), so
+nothing extra needs to be installed.
+"""
+
+import os
+import re
+import json
+import tempfile
+import time
+import zipfile
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
+
+from PyQt5.QtCore import (Qt, pyqtSignal, QRectF, QEvent, QPoint, QMimeData,
+                          QTimer, QRect, QSize)
+from PyQt5.QtGui import (QColor, QFont, QFontMetricsF, QImage, QPainter,
+                         QPainterPath, QBrush, QPen, QTextCursor, QDrag,
+                         QCursor, QKeySequence)
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+    QPlainTextEdit, QSpinBox, QCheckBox, QFileDialog, QColorDialog,
+    QMessageBox, QSizePolicy, QFrame, QLineEdit, QListWidget, QListWidgetItem,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
+    QInputDialog, QScrollArea, QTabBar, QTabWidget, QToolButton, QMenu,
+    QDialog, QButtonGroup, QSplitter, QDialogButtonBox, QApplication,
+    QShortcut, QLayout,
+)
+
+# Drag & drop mime type carrying a panel id while a PanelBox is dragged by
+# its header (customize mode only).
+PANEL_MIME = "application/x-typer-panel"
+
+# How many generic host dockers are pre-registered so a panel can be detached
+# into its own Krita-dockable window (kept in sync with layoutmodel).
+MAX_DETACH_SLOTS = 3
+
+# slot index -> live TyperExtraHost instance. Filled as Krita constructs the
+# pre-registered host dockers; read by the main docker when detaching a panel.
+_EXTRA_HOSTS = {}
+from PyQt5.QtGui import QFontDatabase
+
+from krita import (DockWidget, DockWidgetFactory, DockWidgetFactoryBase,
+                   Krita, Selection)
+
+from . import layout as L
+from . import langpair as LP
+
+
+# ---------------------------------------------------------------------------
+# Wheel-safe widgets
+#
+# A QComboBox/QSpinBox changes its value on a mouse-wheel tick even when it
+# only happens to be under the cursor while the user scrolls the panel. That
+# silently switches the manga/character/preset/etc. by accident. These
+# subclasses only react to the wheel when they actually have keyboard focus
+# (i.e. the user clicked into them first); otherwise the wheel event is passed
+# on so the surrounding scroll area scrolls instead.
+# ---------------------------------------------------------------------------
+class NoScrollComboBox(QComboBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoScrollSpinBox(QSpinBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class ScriptTabBar(QTabBar):
+    """Tab bar for the loaded scripts. Adds browser-style middle-click-to-close
+    on top of the normal close button."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            idx = self.tabAt(event.pos())
+            if idx >= 0:
+                self.tabCloseRequested.emit(idx)
+                return
+        super().mousePressEvent(event)
+
+
+class OldDocError(Exception):
+    """Old binary format (.doc/.xls) that cannot be read directly."""
+
+    def __init__(self, fmt=".doc"):
+        super().__init__(fmt)
+        self.fmt = fmt
+
+
+# ---------------------------------------------------------------------------
+# User-interface translations
+# ---------------------------------------------------------------------------
+
+LANG = {
+    "en": {
+        "title": "TypeR for Krita — Performance",
+        "language": "Language:",
+        "load_btn": "Load script (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Script (load a file or paste directly):",
+        "editor_ph": "Paste the script here, or load a file above …",
+        "skip_empty": "Skip empty lines",
+        "analyze_btn": "Analyze · pair JP↔EN",
+        "align_label": "Japanese  ↔  Translation   (click to select a line)",
+        "col_source": "Japanese (source)",
+        "col_translation": "Translation",
+        "prev": "◀ Back",
+        "next": "Next ▶",
+        "page_jump": "Jump to page:",
+        "page_item": "Page {label}",
+        "page_status": "Page {cur} / {n}",
+        "page_status_intro": "before first page",
+        "view_toggle": "⚙ Layout & sizes",
+        "view_hint": "Show, resize or hide parts of this panel:",
+        "view_preview": "Preview",
+        "view_editor": "Script box",
+        "view_table": "JP/EN table",
+        "view_fonts": "Font list",
+        "view_reset": "Reset layout",
+        "font": "Font:",
+        "font_search_ph": "Search font … (type to filter)",
+        "style": "Style:",
+        "bold": "Bold",
+        "italic": "Italic",
+        "underline": "Underline",
+        "align": "Alignment:",
+        "align_left": "Left",
+        "align_center": "Center",
+        "align_right": "Right",
+        "valign_label": "Vertical:",
+        "valign_top": "Top",
+        "valign_middle": "Middle",
+        "valign_bottom": "Bottom",
+        "active_ph": "Active line — edit the wording; press Enter for a manual line break.",
+        "preview_label": "Live preview (font + settings):",
+        "preview_empty": "Preview — the active line will appear here.",
+        "lite_mode": "Lite mode (weak PC)",
+        "lite_hint": "No live preview, no anti-aliasing, AI detection off.",
+        "refresh_preview": "Refresh preview",
+        "preview_stale": "Preview paused (Lite mode) — click Refresh.",
+        "reset_btn": "Reset progress",
+        "st_progress_reset": "Progress reset.",
+        "case_label": "Case:",
+        "case_none": "Normal",
+        "case_upper": "UPPERCASE",
+        "case_lower": "lowercase",
+        "bold_sel": "Bold selection",
+        "bold_sel_tip": "Make the selected words bold (wraps them in **…**). Select text first, then click. Click again on the same selection to remove bold.",
+        "st_bold_no_sel": "Select some text in the active line first.",
+        "tidy": "Smart punctuation",
+        "tidy_tip": "Turn straight quotes into curly ones, ... into …, -- into —.",
+        "round": "Round bubble (fit ellipse)",
+        "round_tip": "Fit the text into the ellipse inside the selection so it doesn't overflow a round balloon. Only with auto-fit.",
+        "shadow": "Shadow",
+        "shadow_color_btn": "Shadow color …",
+        "shadow_off": "Offset X / Y (px):",
+        "shadow_tip": "Drop shadow drawn as an offset copy behind the text.",
+        "preset": "Preset:",
+        "preset_none": "(none)",
+        "preset_save": "Save …",
+        "preset_del": "Delete",
+        "preset_import": "Import …",
+        "preset_export": "Export …",
+        "preset_name_dlg": "Save preset",
+        "preset_name_prompt": "Preset name:",
+        "preset_file_save": "Export presets",
+        "preset_file_open": "Import presets",
+        "preset_filter": "TypeR presets (*.json);;All files (*.*)",
+        "st_preset_saved": "Preset ‘{name}’ saved.",
+        "st_preset_applied": "Preset ‘{name}’ applied.",
+        "st_preset_deleted": "Preset ‘{name}’ deleted.",
+        "st_preset_none": "No preset selected.",
+        "st_preset_name_empty": "Please enter a name.",
+        "st_preset_exported": "Exported {n} preset(s).",
+        "st_preset_imported": "Imported {n} preset(s).",
+        "st_preset_import_fail": "Could not read the preset file.",
+        "group": "Manga:",
+        "group_new": "New manga …",
+        "group_del": "Delete manga",
+        "group_default": "Manga 1",
+        "group_new_dlg": "New manga",
+        "group_name_prompt": "Manga name:",
+        "char": "Character:",
+        "char_new": "New character …",
+        "char_del": "Delete character",
+        "char_default": "Character 1",
+        "auto_char": "Auto-pick character from “Name:”",
+        "auto_char_tip": ("If a line starts with a speaker name like “Sakamoto: …” "
+                          "and that name matches one of your characters, switch to "
+                          "that character (and apply its first style preset). The "
+                          "name is also removed from the inserted text."),
+        "st_auto_char": "Auto-character: switched to ‘{name}’.",
+        "auto_manga": "Auto-pick manga from the script",
+        "auto_manga_tip": ("When loading a script, detect the manga from its file "
+                           "name, a “Title:”/“Manga:” header or the first lines, and "
+                           "switch to that saved manga automatically (if it matches "
+                           "one). The character's default style preset is then "
+                           "selected as well."),
+        "st_auto_manga": "Auto-manga: switched to ‘{name}’.",
+        "char_new_dlg": "New character",
+        "char_name_prompt": "Character name:",
+        "style_label": "Style preset:",
+        "st_preset_saved_in": "Preset ‘{name}’ saved for ‘{char}’.",
+        "st_group_saved": "Manga ‘{name}’ created.",
+        "st_group_deleted": "Manga ‘{name}’ deleted.",
+        "st_group_none": "No manga selected.",
+        "st_group_name_empty": "Please enter a manga name.",
+        "st_char_saved": "Character ‘{name}’ created.",
+        "st_char_deleted": "Character ‘{name}’ deleted.",
+        "st_char_none": "No character selected.",
+        "st_char_name_empty": "Please enter a character name.",
+        "size_max": "Max. size (px):",
+        "size_fixed": "Size (px):",
+        "size_tip": "With auto-fit on: the largest allowed size.\nOtherwise: a fixed size.",
+        "color_btn": "Color …",
+        "padding": "Inner padding (%):",
+        "padding_tip": "Space between the text and the edge of the selection.",
+        "spacing": "Line spacing (%):",
+        "outline": "Outline",
+        "outline_tip": "Outlines the text – e.g. a white outline so black text stays readable on a dark background.",
+        "outline_color_btn": "Outline color …",
+        "outline_width": "Width (px):",
+        "auto": "Auto-fit to selection (size + wrap)",
+        "auto_tip": "On: select a speech bubble, pick a font – the text wraps and scales to the largest size that fits.\nOff: fixed size, centered in the image/selection.",
+        "hyphenate": "Hyphenate long words",
+        "hyphenate_tip": "Split words that are too wide at correct syllable points (with a “-”). Lets the text reach a bigger size in narrow bubbles. Only with auto-fit.",
+        "hyph_lang": "Hyphenation language:",
+        "hyph_auto": "Auto",
+        "hyph_en": "English",
+        "hyph_de": "Deutsch",
+        "hyph_es": "Español",
+        "hyph_fr": "Français",
+        "hyph_pt": "Português",
+        "hyph_it": "Italiano",
+        "insert_btn": "Insert translation  ⏎  (and go to next)",
+        "color_dlg": "Choose text color",
+        "outline_color_dlg": "Choose outline color",
+        "file_dlg": "Choose a script file",
+        "file_filter": "Scripts (*.docx *.xlsx *.xlsm *.odt *.txt *.md);;All files (*.*)",
+        # status
+        "st_no_doc": "No document is open.",
+        "st_empty_line": "The active line is empty.",
+        "st_create_fail": "Could not create the text layer: {exc}",
+        "st_inserted_min": "Inserted at minimum size ({px}px) – the text is very long for the selection.",
+        "st_inserted_fit": "Inserted: {px}px, {n} line(s).",
+        "st_inserted": "Line inserted.",
+        "st_not_found": "File not found.",
+        "st_bad_zip": "The file is damaged or not a valid .docx/.xlsx/.odt.",
+        "st_no_content": "No text content was found in the document.",
+        "st_old_doc": "The old {fmt} format can't be read directly. Please open it and save as .docx/.xlsx or .txt.",
+        "st_read_fail": "Could not read the file: {exc}",
+        "st_loaded": "Loaded: {name}  ({n} units)",
+        "st_already_open": "‘{name}’ is already open – switched to its tab.",
+        "tab_untitled": "Untitled",
+        "tab_rename_dlg": "Rename tab",
+        "tab_rename_prompt": "Tab name:",
+        "st_nothing": "Nothing loaded. Paste a script and click ‘Analyze’.",
+        "st_no_font": "No font selected.",
+        "preview_empty": "(empty)",
+        # main tabs
+        "tab_type": "Type",
+        "tab_style": "Style",
+        "tab_presets": "Presets",
+        "tab_setup": "Setup",
+        "close": "Close",
+        "preset_actions": "Preset actions (save, delete, import, export)",
+        "outline_more": "Outline settings …",
+        "shadow_more": "Shadow settings …",
+        # TextShapR
+        "shaper_btn": "TextShapR …",
+        "shaper_btn_tip": ("Pick from several shapes for the current line: the "
+                           "same text arranged into different line counts and "
+                           "proportions, each auto-fitted to the selection."),
+        "shaper_title": "TextShapR",
+        "shaper_balanced": "Balanced",
+        "shaper_round": "Round",
+        "shaper_tall": "Tall",
+        "shaper_wide": "Wide",
+        "shaper_hyph": "Hyphenation",
+        "shaper_hint": "Click a shape to test it. Shift+number applies and advances.",
+        "shaper_apply": "Apply",
+        "shaper_apply_next": "Apply + next",
+        "shaper_empty": ("No arrangements to show. Pick a font and make sure "
+                         "the active line has text."),
+        "shaper_no_doc": "No document open – previews use a default box.",
+        # replace previously inserted layers on re-insert
+        "replace_existing": "Replace previously inserted line",
+        "replace_existing_tip": ("Inserting a line again first deletes the "
+                                 "layer(s) TypeR created for it earlier – so "
+                                 "trying several TextShapR shapes for the same "
+                                 "bubble replaces the text instead of stacking "
+                                 "copies. Off: every insert adds a new layer."),
+        "st_replaced": "Replaced previous layer.",
+        # optional character level for presets
+        "presets_by_char": "Organize presets by character",
+        "presets_by_char_tip": ("On: pick Manga → Character → preset – each "
+                                "character can have its own font and style. "
+                                "Off: pick Manga → preset – one flat list of "
+                                "the manga's text presets (the character level "
+                                "is hidden; new presets are stored under the "
+                                "manga's default character)."),
+        # BubblR tab (automatic bubble detection + per-bubble styles)
+        "tab_bubblr": "BubblR",
+        "bp_backend_heur": "Heuristic (built-in)",
+        "bp_backend_ai": "AI (BubblR-AI)",
+        "bp_backend_tip": ("How bubbles/free text are found: the built-in "
+                           "heuristic or the learned model in the BubblR "
+                           "'ai' folder (run ai\\setup.ps1 once)."),
+        "bp_detect": "Detect bubbles",
+        "bp_add_sel": "Add bubble from selection",
+        "bp_reset": "Reset order",
+        "bp_order": "Set order",
+        "bp_order_tip": ("Click the bubbles in the order you want them "
+                         "numbered (finish by clicking them all; click the "
+                         "button again to cancel)."),
+        "bp_sfxmark": "Mark SFX",
+        "bp_sfxmark_tip": ("While active, click a box to switch it between "
+                           "speech bubble and SFX / free text (blue). Click "
+                           "the button again to leave the mode."),
+        "bp_shapemark": "Toggle shape",
+        "bp_shapemark_tip": ("While active, click a box to force its shape "
+                             "round <-> rectangular (overrides the automatic "
+                             "shape). Click the button again to leave."),
+        "bp_edit": "Edit boxes",
+        "bp_edit_tip": ("While active: drag on empty page to draw a new box, "
+                        "drag a box to move it, drag a corner to resize. "
+                        "Right-click removes. Shortcuts (click the image "
+                        "first): E/Q next/prev, S = SFX, R = shape, Del = "
+                        "remove."),
+        "bp_panelorder": "Panel order",
+        "bp_panelorder_tip": ("Detect comic panels (Magi AI) and renumber the "
+                              "bubbles panel by panel — fixes wrong order "
+                              "across side-by-side panels. First run downloads "
+                              "the Magi model."),
+        "bp_save_boxes": "Save boxes",
+        "bp_save_boxes_tip": ("Save the current boxes to a .json file so you "
+                              "can resume labelling this page later."),
+        "bp_load_boxes": "Load boxes",
+        "bp_load_boxes_tip": "Load boxes from a saved .json file.",
+        "bp_model": "Model:",
+        "bp_model_tip": ("Which detector weights to use. Auto uses your "
+                         "fine-tuned model only if it beat the baseline in "
+                         "eval; otherwise the baseline. Kitsumed = stronger "
+                         "bubble model with real shape from a mask (bubbles "
+                         "only); Hybrid = kitsumed bubbles + your model's SFX. "
+                         "Both need the training setup and download on first "
+                         "use."),
+        "bp_model_auto": "Auto (best)",
+        "bp_model_baseline": "Baseline",
+        "bp_model_finetuned": "Fine-tuned",
+        "bp_model_kitsumed": "kitsumed (bubbles + shape)",
+        "bp_model_hybrid": "Hybrid (kitsumed + SFX)",
+        "bp_conf": "Bubbles",
+        "bp_conf_tip": ("Detection sensitivity: lower = more boxes (more "
+                        "recall, more false ones), higher = fewer, surer "
+                        "boxes."),
+        "bp_sfxconf": "SFX",
+        "bp_reset_tip": "Back to the automatic reading order.",
+        "bp_chk_text": "Bubbles must contain text",
+        "bp_chk_text_tip": ("Heuristic only: accept only white regions with "
+                            "text inside (raw pages). Turn off for cleaned "
+                            "pages."),
+        "bp_chk_sfx": "Also detect free text (SFX)",
+        "bp_chk_sfx_tip": ("Find handwritten SFX/mutterings without a bubble "
+                           "and add them as blue boxes."),
+        "bp_rtl": "Manga (right-to-left)",
+        "bp_rtl_tip": ("Reading order: right-to-left for manga, unchecked = "
+                       "left-to-right for western comics."),
+        "bp_tile": "More accurate (slower)",
+        "bp_tile_tip": ("Scan big pages in overlapping tiles so small SFX / "
+                        "text are found at full resolution. Turn OFF on a "
+                        "weak PC or laptop for a much faster (but coarser) "
+                        "detection."),
+        "bp_overlay_tip": ("Click a box to make it the current bubble; "
+                           "Ctrl+click boxes in the desired order to "
+                           "renumber; right-click removes a box."),
+        "bubble_of": "Bubble {cur} / {n}",
+        "bubble_prev_tip": "Previous bubble (redo it — Insert replaces).",
+        "bubble_next_tip": "Next bubble.",
+        "panel_move_to": "Move to → {tab}",
+        "panel_up": "Move up",
+        "panel_down": "Move down",
+        "panel_detach": "Detach into window",
+        "panel_reattach": "Reattach into tab",
+        "detach_host_hint": ("Detached TypeR panels appear here. "
+                             "Use a panel's ⋮ menu → Reattach to send it back."),
+        "panel_presets": "Presets",
+        "panel_table": "Japanese / Translation",
+        "panel_preview": "Preview",
+        "panel_script": "Script",
+        "panel_nav": "Navigation",
+        "panel_active": "Text field",
+        "panel_font": "Font & color",
+        "panel_insert": "Insert",
+        "panel_style_basic": "Style & alignment",
+        "panel_style_size": "Size & fit",
+        "panel_style_outline": "Outline",
+        "panel_style_shadow": "Shadow",
+        "panel_hyphenation": "Hyphenation",
+        "panel_bubblr_detect": "Detection",
+        "panel_bubblr_overlay": "Bubble preview",
+        "panel_setup_general": "General",
+        "panel_layout_sizes": "Layout & sizes",
+        "exp_section": "Experimental",
+        "enable_bubblr": "Enable BubblR (automatic bubble detection)",
+        "enable_shapr": "Enable TextShapR",
+        "bp_hint": ("BubblR only marks the bubbles. Type the text on the "
+                    "Type tab — Insert fills the current bubble and steps "
+                    "to the next; ◀/▶ there redo a bubble."),
+        "customize_layout": "Customize layout (rename && reorder tabs)",
+        "customize_hint": ("Drag the tabs to reorder them; double-click a tab "
+                           "to rename it. Panels can be moved between tabs in "
+                           "a later update."),
+        "layout_reset": "Reset layout",
+        "layout_reset_done": "Layout reset to defaults.",
+        "tab_rename_title": "Rename tab",
+        "tab_rename_prompt": "Tab name (empty = default):",
+        "bp_place_next": "Place && next",
+        "bp_place_next_tip": ("Insert the current bubble's line and jump to "
+                              "the next un-placed bubble — the Insert "
+                              "rhythm of the Type tab."),
+        "bp_selfollow": "Selection follows current bubble",
+        "bp_selfollow_tip": ("The current bubble's rect becomes the Krita "
+                             "selection, so Insert/TextShapR on the Type "
+                             "tab work on it too. Off: your selection is "
+                             "never touched."),
+        "bp_sfx_db": "SFX words…",
+        "bp_sfx_db_tip": ("Vocabulary used to recognize SFX lines in the "
+                          "script (so they don't eat bubble slots while SFX "
+                          "boxes are ignored). One word per line; "
+                          "elongations like GOGOGOGO are matched "
+                          "automatically."),
+        "bp_sfx_dlg_hint": ("Your own SFX words, one per line (added to the "
+                            "built-in list):"),
+        "bp_src_sfx_suffix": ", {n} SFX skipped",
+        "st_bp_all_done": "All mapped lines are placed.",
+        "bp_src_page": "Lines: page {page} ({n} units)",
+        "bp_src_all": "Lines: whole script ({n} units)",
+        "bp_col_num": "#",
+        "bp_col_text": "Text",
+        "bp_col_style": "Style",
+        "bp_up_tip": "Move the selected line up (previous box).",
+        "bp_down_tip": "Move the selected line down (next box).",
+        "bp_gap_add_tip": ("Insert a gap: this box gets no line; the lines "
+                           "below shift down."),
+        "bp_gap_rm_tip": ("Remove a gap: this box takes the next line; the "
+                          "lines below shift up."),
+        "bp_assign": "Assign current style",
+        "bp_assign_tip": ("Store the current style (font, Style tab, preset) "
+                          "on the selected row(s) – those bubbles keep it "
+                          "when placing, others use the style active at "
+                          "placement time."),
+        "bp_unassign": "Use current style",
+        "bp_unassign_tip": ("Remove the stored style from the selected "
+                            "row(s); they follow the active style again "
+                            "(auto-character styles are not re-applied)."),
+        "bp_place": "Place all",
+        "bp_place_sel": "Place selected",
+        "bp_export": "Export training example",
+        "bp_export_tip": ("Save this page + the corrected boxes as an AI "
+                          "training sample into the ai folder's dataset."),
+        "bp_pick_ai": "Select the BubblR 'ai' folder",
+        "st_bp_no_script": "Load a script on the Type tab first.",
+        "st_bp_unsupported": ("Unsupported image: {model}/{depth} – only "
+                              "8-bit RGBA or grayscale documents work."),
+        "st_bp_detected": "{n} box(es) detected.",
+        "st_bp_none": "No bubbles detected.",
+        "st_bp_mismatch": ("Warning: {b} boxes but {u} script lines – only "
+                           "matching pairs will be placed."),
+        "st_bp_no_sel": "No selection – select a bubble first.",
+        "st_bp_added": "Box {n} added from the selection.",
+        "st_bp_renumbered": "New order applied.",
+        "st_bp_order_mode": ("Set order: click the bubbles in reading "
+                             "order."),
+        "st_bp_sfx_mode": ("Mark SFX: click a box to switch it between "
+                           "bubble and SFX."),
+        "st_bp_shape_mode": ("Toggle shape: click a box to flip it round / "
+                             "rectangular."),
+        "st_bp_edit_mode": ("Edit boxes: drag empty = new, drag box = move, "
+                            "drag corner = resize, right-click = remove."),
+        "st_bp_panels_wait": "Detecting panels (Magi)…",
+        "st_bp_panels": "Reordered by {n} panel(s).",
+        "st_bp_saved": "Boxes saved to {name}.",
+        "st_bp_loaded": "Loaded {n} box(es).",
+        "st_bp_style_set": "Style stored on {n} row(s).",
+        "st_bp_style_cleared": "Stored style removed from {n} row(s).",
+        "st_bp_no_rows": "Select row(s) in the table first.",
+        "st_bp_placed": "{n} line(s) placed.",
+        "st_bp_ai_missing": ("AI backend not found – run ai\\setup.ps1 once, "
+                             "then select the 'ai' folder."),
+        "st_bp_ai_lite": ("AI detection is off in Lite mode (too heavy for "
+                          "weak PCs). Turn off Lite mode to use it."),
+        "st_bp_ai_error": "AI detection failed: {msg}",
+        "st_bp_exported": "Training example saved: {name}",
+        "st_bp_export_none": "Nothing to export – detect boxes first.",
+        "view_bubblr": "BubblR preview",
+        "view_bmap": "BubblR table",
+    },
+    "de": {
+        "title": "TypeR für Krita — Performance",
+        "language": "Sprache:",
+        "load_btn": "Skript laden (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Skript (Datei laden oder direkt einfügen):",
+        "editor_ph": "Hier das Skript einfügen oder oben eine Datei laden …",
+        "skip_empty": "Leere Zeilen überspringen",
+        "analyze_btn": "Analysieren · JP↔EN paaren",
+        "align_label": "Japanisch  ↔  Übersetzung   (Klick wählt die Zeile)",
+        "col_source": "Japanisch (Quelle)",
+        "col_translation": "Übersetzung",
+        "prev": "◀ Zurück",
+        "next": "Weiter ▶",
+        "page_jump": "Zu Seite springen:",
+        "page_item": "Seite {label}",
+        "page_status": "Seite {cur} / {n}",
+        "page_status_intro": "vor erster Seite",
+        "view_toggle": "⚙ Layout & Größen",
+        "view_hint": "Teile dieses Panels zeigen, vergrößern/verkleinern oder ausblenden:",
+        "view_preview": "Vorschau",
+        "view_editor": "Skript-Feld",
+        "view_table": "JP/EN-Tabelle",
+        "view_fonts": "Schriftliste",
+        "view_reset": "Layout zurücksetzen",
+        "font": "Schrift:",
+        "font_search_ph": "Schrift suchen … (Tippen filtert)",
+        "style": "Stil:",
+        "bold": "Fett",
+        "italic": "Kursiv",
+        "underline": "Unterstrichen",
+        "align": "Ausrichtung:",
+        "align_left": "Links",
+        "align_center": "Zentriert",
+        "align_right": "Rechts",
+        "valign_label": "Vertikal:",
+        "valign_top": "Oben",
+        "valign_middle": "Mitte",
+        "valign_bottom": "Unten",
+        "active_ph": "Aktive Zeile — Wortlaut anpassen; Enter setzt einen manuellen Umbruch.",
+        "preview_label": "Live-Vorschau (Schrift + Einstellungen):",
+        "preview_empty": "Vorschau — die aktive Zeile erscheint hier.",
+        "lite_mode": "Lite-Modus (schwacher PC)",
+        "lite_hint": "Keine Live-Vorschau, kein Anti-Aliasing, KI-Erkennung aus.",
+        "refresh_preview": "Vorschau aktualisieren",
+        "preview_stale": "Vorschau pausiert (Lite-Modus) – auf „Aktualisieren“ klicken.",
+        "reset_btn": "Fortschritt zurücksetzen",
+        "st_progress_reset": "Fortschritt zurückgesetzt.",
+        "case_label": "Schreibung:",
+        "case_none": "Normal",
+        "case_upper": "GROSSBUCHSTABEN",
+        "case_lower": "kleinbuchstaben",
+        "bold_sel": "Auswahl fett",
+        "bold_sel_tip": "Markierte Wörter fett machen (umschließt sie mit **…**). Erst Text markieren, dann klicken. Erneut auf dieselbe Auswahl klicken hebt Fett wieder auf.",
+        "st_bold_no_sel": "Bitte zuerst Text in der aktiven Zeile markieren.",
+        "tidy": "Typografie verbessern",
+        "tidy_tip": "Gerade Anführungszeichen werden typografisch, ... wird …, -- wird —.",
+        "round": "Runde Sprechblase (Ellipse)",
+        "round_tip": "Text in die Ellipse innerhalb der Auswahl einpassen, damit er nicht über eine runde Blase hinausragt. Nur mit Auto-Anpassung.",
+        "shadow": "Schatten",
+        "shadow_color_btn": "Schattenfarbe …",
+        "shadow_off": "Versatz X / Y (px):",
+        "shadow_tip": "Schlagschatten als versetzte Kopie hinter dem Text.",
+        "preset": "Preset:",
+        "preset_none": "(keins)",
+        "preset_save": "Speichern …",
+        "preset_del": "Löschen",
+        "preset_import": "Importieren …",
+        "preset_export": "Exportieren …",
+        "preset_name_dlg": "Preset speichern",
+        "preset_name_prompt": "Preset-Name:",
+        "preset_file_save": "Presets exportieren",
+        "preset_file_open": "Presets importieren",
+        "preset_filter": "TypeR-Presets (*.json);;Alle Dateien (*.*)",
+        "st_preset_saved": "Preset ‚{name}‘ gespeichert.",
+        "st_preset_applied": "Preset ‚{name}‘ angewendet.",
+        "st_preset_deleted": "Preset ‚{name}‘ gelöscht.",
+        "st_preset_none": "Kein Preset gewählt.",
+        "st_preset_name_empty": "Bitte einen Namen eingeben.",
+        "st_preset_exported": "{n} Preset(s) exportiert.",
+        "st_preset_imported": "{n} Preset(s) importiert.",
+        "st_preset_import_fail": "Preset-Datei konnte nicht gelesen werden.",
+        "group": "Manga:",
+        "group_new": "Neues Manga …",
+        "group_del": "Manga löschen",
+        "group_default": "Manga 1",
+        "group_new_dlg": "Neues Manga",
+        "group_name_prompt": "Manga-Name:",
+        "char": "Charakter:",
+        "char_new": "Neuer Charakter …",
+        "char_del": "Charakter löschen",
+        "char_default": "Charakter 1",
+        "auto_char": "Charakter aus „Name:“ automatisch wählen",
+        "auto_char_tip": ("Beginnt eine Zeile mit einem Sprechernamen wie "
+                          "„Sakamoto: …“ und passt der Name zu einem deiner "
+                          "Charaktere, wird zu diesem Charakter gewechselt (und "
+                          "sein erstes Stil-Preset angewendet). Der Name wird "
+                          "außerdem aus dem eingefügten Text entfernt."),
+        "st_auto_char": "Auto-Charakter: zu ‚{name}‘ gewechselt.",
+        "auto_manga": "Manga aus dem Script automatisch wählen",
+        "auto_manga_tip": ("Beim Laden eines Scripts den Manga am Dateinamen, an "
+                           "einer „Title:“/„Manga:“-Kopfzeile oder den ersten "
+                           "Zeilen erkennen und automatisch zu diesem gespeicherten "
+                           "Manga wechseln (sofern einer passt). Danach wird auch "
+                           "das Standard-Stil-Preset des Charakters gewählt."),
+        "st_auto_manga": "Auto-Manga: zu ‚{name}‘ gewechselt.",
+        "char_new_dlg": "Neuer Charakter",
+        "char_name_prompt": "Charakter-Name:",
+        "style_label": "Stil-Preset:",
+        "st_preset_saved_in": "Preset ‚{name}‘ für ‚{char}‘ gespeichert.",
+        "st_group_saved": "Manga ‚{name}‘ erstellt.",
+        "st_group_deleted": "Manga ‚{name}‘ gelöscht.",
+        "st_group_none": "Kein Manga gewählt.",
+        "st_group_name_empty": "Bitte einen Manga-Namen eingeben.",
+        "st_char_saved": "Charakter ‚{name}‘ erstellt.",
+        "st_char_deleted": "Charakter ‚{name}‘ gelöscht.",
+        "st_char_none": "Kein Charakter gewählt.",
+        "st_char_name_empty": "Bitte einen Charakter-Namen eingeben.",
+        "size_max": "Max. Größe (px):",
+        "size_fixed": "Größe (px):",
+        "size_tip": "Bei aktiver Auto-Anpassung: größte erlaubte Schriftgröße.\nSonst: feste Schriftgröße.",
+        "color_btn": "Farbe …",
+        "padding": "Innenabstand (%):",
+        "padding_tip": "Luft zwischen Text und Rand der Auswahl.",
+        "spacing": "Zeilenabstand (%):",
+        "outline": "Kontur",
+        "outline_tip": "Umrandet den Text – z. B. weiße Kontur, damit schwarzer Text auf dunklem Hintergrund lesbar bleibt.",
+        "outline_color_btn": "Konturfarbe …",
+        "outline_width": "Breite (px):",
+        "auto": "Automatisch in Auswahl einpassen (Größe + Umbruch)",
+        "auto_tip": "An: Auswahl als Sprechblase markieren, Font wählen – der Text bricht um und wird auf die größte passende Größe skaliert.\nAus: feste Größe, in der Bild-/Auswahlmitte.",
+        "hyphenate": "Lange Wörter trennen",
+        "hyphenate_tip": "Zu breite Wörter an korrekten Silbengrenzen trennen (mit „-“). So passt der Text in schmale Blasen größer. Nur mit Auto-Anpassung.",
+        "hyph_lang": "Trennsprache:",
+        "hyph_auto": "Auto",
+        "hyph_en": "English",
+        "hyph_de": "Deutsch",
+        "hyph_es": "Español",
+        "hyph_fr": "Français",
+        "hyph_pt": "Português",
+        "hyph_it": "Italiano",
+        "insert_btn": "Übersetzung einfügen  ⏎  (und zur nächsten)",
+        "color_dlg": "Textfarbe wählen",
+        "outline_color_dlg": "Konturfarbe wählen",
+        "file_dlg": "Skript-Datei wählen",
+        "file_filter": "Skripte (*.docx *.xlsx *.xlsm *.odt *.txt *.md);;Alle Dateien (*.*)",
+        # status
+        "st_no_doc": "Kein geöffnetes Dokument.",
+        "st_empty_line": "Die aktive Zeile ist leer.",
+        "st_create_fail": "Konnte Textebene nicht erstellen: {exc}",
+        "st_inserted_min": "Eingefügt bei Minimalgröße ({px}px) – Text ist für die Auswahl sehr lang.",
+        "st_inserted_fit": "Eingefügt: {px}px, {n} Zeile(n).",
+        "st_inserted": "Zeile eingefügt.",
+        "st_not_found": "Datei nicht gefunden.",
+        "st_bad_zip": "Datei ist beschädigt oder keine gültige .docx/.xlsx/.odt.",
+        "st_no_content": "Im Dokument wurde kein Textinhalt gefunden.",
+        "st_old_doc": "Das alte {fmt}-Format kann nicht direkt gelesen werden. Bitte öffnen und als .docx/.xlsx oder .txt speichern.",
+        "st_read_fail": "Konnte Datei nicht lesen: {exc}",
+        "st_loaded": "Geladen: {name}  ({n} Einheiten)",
+        "st_already_open": "‚{name}‘ ist schon offen – zum Tab gewechselt.",
+        "tab_untitled": "Unbenannt",
+        "tab_rename_dlg": "Tab umbenennen",
+        "tab_rename_prompt": "Tab-Name:",
+        "st_nothing": "Nichts geladen. Erst Skript einfügen und ‚Analysieren‘ klicken.",
+        "st_no_font": "Keine Schrift gewählt.",
+        "preview_empty": "(leer)",
+        # main tabs
+        "tab_type": "Setzen",
+        "tab_style": "Stil",
+        "tab_presets": "Presets",
+        "tab_setup": "Einstellungen",
+        "close": "Schließen",
+        "preset_actions": "Preset-Aktionen (speichern, löschen, importieren, exportieren)",
+        "outline_more": "Kontur-Einstellungen …",
+        "shadow_more": "Schatten-Einstellungen …",
+        # TextShapR
+        "shaper_btn": "TextShapR …",
+        "shaper_btn_tip": ("Für die aktive Zeile aus mehreren Formen wählen: "
+                           "derselbe Text in verschiedenen Zeilenzahlen und "
+                           "Proportionen, jeweils automatisch in die Auswahl "
+                           "eingepasst."),
+        "shaper_title": "TextShapR",
+        "shaper_balanced": "Ausgewogen",
+        "shaper_round": "Rund",
+        "shaper_tall": "Hoch",
+        "shaper_wide": "Breit",
+        "shaper_hyph": "Silbentrennung",
+        "shaper_hint": "Klick testet eine Form. Umschalt+Zahl fügt ein und geht weiter.",
+        "shaper_apply": "Einfügen",
+        "shaper_apply_next": "Einfügen + weiter",
+        "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
+                         "sicherstellen, dass die aktive Zeile Text hat."),
+        "shaper_no_doc": "Kein Dokument offen – Vorschau nutzt eine Standard-Box.",
+        # replace previously inserted layers on re-insert
+        "replace_existing": "Bereits eingefügte Zeile ersetzen",
+        "replace_existing_tip": ("Beim erneuten Einfügen einer Zeile werden die "
+                                 "zuvor von TypeR dafür erstellten Ebene(n) "
+                                 "gelöscht – das Ausprobieren mehrerer "
+                                 "TextShapR-Formen für dieselbe Blase ersetzt "
+                                 "den Text also, statt Kopien zu stapeln. Aus: "
+                                 "jedes Einfügen erzeugt eine neue Ebene."),
+        "st_replaced": "Vorherige Ebene ersetzt.",
+        # optional character level for presets
+        "presets_by_char": "Presets nach Charakteren gliedern",
+        "presets_by_char_tip": ("An: Manga → Charakter → Preset wählen – jeder "
+                                "Charakter kann eigene Schrift und eigenen Stil "
+                                "haben. Aus: Manga → Preset wählen – eine "
+                                "flache Liste aller Text-Presets des Mangas "
+                                "(die Charakter-Ebene ist ausgeblendet; neue "
+                                "Presets landen beim Standard-Charakter des "
+                                "Mangas)."),
+        # BubblR tab (automatic bubble detection + per-bubble styles)
+        "tab_bubblr": "BubblR",
+        "bp_backend_heur": "Heuristik (eingebaut)",
+        "bp_backend_ai": "KI (BubblR-AI)",
+        "bp_backend_tip": ("Wie Bubbles/freier Text gefunden werden: "
+                           "eingebaute Heuristik oder das gelernte Modell im "
+                           "BubblR-'ai'-Ordner (einmalig ai\\setup.ps1 "
+                           "ausführen)."),
+        "bp_detect": "Bubbles erkennen",
+        "bp_add_sel": "Bubble aus Auswahl hinzufügen",
+        "bp_reset": "Reihenfolge zurücksetzen",
+        "bp_order": "Reihenfolge festlegen",
+        "bp_order_tip": ("Die Bubbles in der gewünschten Reihenfolge "
+                         "anklicken (fertig, wenn alle geklickt sind; nochmal "
+                         "auf den Knopf = abbrechen)."),
+        "bp_sfxmark": "SFX markieren",
+        "bp_sfxmark_tip": ("Wenn aktiv, eine Box anklicken, um zwischen "
+                           "Sprechblase und SFX / freier Text (blau) zu "
+                           "wechseln. Nochmal auf den Knopf = beenden."),
+        "bp_shapemark": "Form wechseln",
+        "bp_shapemark_tip": ("Wenn aktiv, eine Box anklicken, um ihre Form "
+                             "rund <-> eckig zu erzwingen (überschreibt die "
+                             "automatische Form). Nochmal auf den Knopf = "
+                             "beenden."),
+        "bp_edit": "Boxen bearbeiten",
+        "bp_edit_tip": ("Wenn aktiv: auf leerer Seite ziehen = neue Box, "
+                        "Box ziehen = verschieben, Ecke ziehen = Größe. "
+                        "Rechtsklick entfernt. Tasten (vorher aufs Bild "
+                        "klicken): E/Q vor/zurück, S = SFX, R = Form, "
+                        "Entf = löschen."),
+        "bp_panelorder": "Panel-Reihenfolge",
+        "bp_panelorder_tip": ("Comic-Panels erkennen (Magi-KI) und die Bubbles "
+                              "panelweise neu nummerieren — behebt falsche "
+                              "Reihenfolge bei nebeneinanderliegenden Panels. "
+                              "Erster Aufruf lädt das Magi-Modell herunter."),
+        "bp_save_boxes": "Boxen speichern",
+        "bp_save_boxes_tip": ("Aktuelle Boxen als .json speichern, um das "
+                              "Labeln dieser Seite später fortzusetzen."),
+        "bp_load_boxes": "Boxen laden",
+        "bp_load_boxes_tip": "Boxen aus einer gespeicherten .json-Datei laden.",
+        "bp_model": "Modell:",
+        "bp_model_tip": ("Welche Detektor-Gewichte. Auto nutzt dein "
+                         "trainiertes Modell nur, wenn es im Test besser "
+                         "war als das Basis-Modell; sonst das Basis-Modell. "
+                         "Kitsumed = stärkeres Blasen-Modell mit echter Form "
+                         "aus einer Maske (nur Blasen); Hybrid = kitsumed-"
+                         "Blasen + SFX deines Modells. Beide brauchen das "
+                         "Training-Setup und laden beim ersten Mal herunter."),
+        "bp_model_auto": "Auto (bestes)",
+        "bp_model_baseline": "Basis",
+        "bp_model_finetuned": "Trainiert",
+        "bp_model_kitsumed": "kitsumed (Blasen + Form)",
+        "bp_model_hybrid": "Hybrid (kitsumed + SFX)",
+        "bp_conf": "Bubbles",
+        "bp_conf_tip": ("Empfindlichkeit: niedriger = mehr Boxen (mehr "
+                        "Treffer, aber auch mehr falsche), höher = weniger, "
+                        "sicherere Boxen."),
+        "bp_sfxconf": "SFX",
+        "bp_reset_tip": "Zurück zur automatischen Lesereihenfolge.",
+        "bp_chk_text": "Bubbles müssen Text enthalten",
+        "bp_chk_text_tip": ("Nur Heuristik: nur weiße Flächen mit Text darin "
+                            "akzeptieren (Raw-Seiten). Für gecleante Seiten "
+                            "ausschalten."),
+        "bp_chk_sfx": "Auch freien Text finden (SFX)",
+        "bp_chk_sfx_tip": ("Handgeschriebene SFX/Murmeln ohne Bubble finden "
+                           "und als blaue Boxen hinzufügen."),
+        "bp_rtl": "Manga (rechts-nach-links)",
+        "bp_rtl_tip": ("Leserichtung: rechts-nach-links für Manga, ohne "
+                       "Haken = links-nach-rechts für westliche Comics."),
+        "bp_tile": "Genauer (langsamer)",
+        "bp_tile_tip": ("Große Seiten in überlappenden Kacheln absuchen, "
+                        "damit kleine SFX / Texte in voller Auflösung "
+                        "gefunden werden. Auf schwachem PC oder Laptop "
+                        "ausschalten für eine viel schnellere (aber gröbere) "
+                        "Erkennung."),
+        "bp_overlay_tip": ("Klick macht eine Box zur aktuellen Bubble; "
+                           "Strg+Klick in gewünschter Reihenfolge "
+                           "nummeriert neu; Rechtsklick entfernt eine "
+                           "Box."),
+        "bubble_of": "Bubble {cur} / {n}",
+        "bubble_prev_tip": ("Vorherige Bubble (neu machen — Insert "
+                            "ersetzt)."),
+        "bubble_next_tip": "Nächste Bubble.",
+        "panel_move_to": "Verschieben nach → {tab}",
+        "panel_up": "Nach oben",
+        "panel_down": "Nach unten",
+        "panel_detach": "In Fenster lösen",
+        "panel_reattach": "Zurück in Tab",
+        "detach_host_hint": ("Abgelöste TypeR-Panels erscheinen hier. "
+                             "Über ⋮ → Zurück in Tab zurückholen."),
+        "panel_presets": "Presets",
+        "panel_table": "Japanisch / Übersetzung",
+        "panel_preview": "Vorschau",
+        "panel_script": "Skript",
+        "panel_nav": "Navigation",
+        "panel_active": "Textfeld",
+        "panel_font": "Schrift & Farbe",
+        "panel_insert": "Einfügen",
+        "panel_style_basic": "Stil & Ausrichtung",
+        "panel_style_size": "Größe & Anpassung",
+        "panel_style_outline": "Kontur",
+        "panel_style_shadow": "Schatten",
+        "panel_hyphenation": "Silbentrennung",
+        "panel_bubblr_detect": "Erkennung",
+        "panel_bubblr_overlay": "Bubble-Vorschau",
+        "panel_setup_general": "Allgemein",
+        "panel_layout_sizes": "Layout & Größen",
+        "exp_section": "Experimentell",
+        "enable_bubblr": "BubblR aktivieren (automatische Bubble-Erkennung)",
+        "enable_shapr": "TextShapR aktivieren",
+        "bp_hint": ("BubblR markiert nur die Bubbles. Den Text schreibst du "
+                    "im Type-Tab — Insert füllt die aktuelle Bubble und geht "
+                    "weiter; ◀/▶ dort machen eine Bubble neu."),
+        "customize_layout": "Layout anpassen (Tabs umbenennen && umordnen)",
+        "customize_hint": ("Tabs ziehen zum Umordnen; Doppelklick auf einen "
+                           "Tab zum Umbenennen. Panels lassen sich in einem "
+                           "späteren Update zwischen Tabs verschieben."),
+        "layout_reset": "Layout zurücksetzen",
+        "layout_reset_done": "Layout auf Standard zurückgesetzt.",
+        "tab_rename_title": "Tab umbenennen",
+        "tab_rename_prompt": "Tab-Name (leer = Standard):",
+        "bp_place_next": "Platzieren && weiter",
+        "bp_place_next_tip": ("Zeile der aktuellen Bubble einfügen und zur "
+                              "nächsten offenen Bubble springen — der "
+                              "Insert-Rhythmus des Type-Tabs."),
+        "bp_selfollow": "Auswahl folgt aktueller Bubble",
+        "bp_selfollow_tip": ("Das Rechteck der aktuellen Bubble wird zur "
+                             "Krita-Auswahl, damit auch Insert/TextShapR "
+                             "vom Type-Tab darauf arbeiten. Aus: deine "
+                             "Auswahl wird nie angefasst."),
+        "bp_sfx_db": "SFX-Wörter…",
+        "bp_sfx_db_tip": ("Wortschatz, mit dem SFX-Zeilen im Skript erkannt "
+                          "werden (damit sie keine Bubbles verbrauchen, "
+                          "solange SFX-Boxen ignoriert werden). Ein Wort "
+                          "pro Zeile; Dehnungen wie GOGOGOGO werden "
+                          "automatisch erkannt."),
+        "bp_sfx_dlg_hint": ("Eigene SFX-Wörter, eins pro Zeile (ergänzt die "
+                            "eingebaute Liste):"),
+        "bp_src_sfx_suffix": ", {n} SFX übersprungen",
+        "st_bp_all_done": "Alle zugeordneten Zeilen sind platziert.",
+        "bp_src_page": "Zeilen: Seite {page} ({n} Einheiten)",
+        "bp_src_all": "Zeilen: ganzes Skript ({n} Einheiten)",
+        "bp_col_num": "#",
+        "bp_col_text": "Text",
+        "bp_col_style": "Stil",
+        "bp_up_tip": "Markierte Zeile nach oben schieben (vorherige Box).",
+        "bp_down_tip": "Markierte Zeile nach unten schieben (nächste Box).",
+        "bp_gap_add_tip": ("Lücke einfügen: diese Box bekommt keine Zeile; "
+                           "die folgenden Zeilen rutschen nach unten."),
+        "bp_gap_rm_tip": ("Lücke entfernen: diese Box bekommt die nächste "
+                          "Zeile; die folgenden rutschen nach oben."),
+        "bp_assign": "Aktuellen Stil zuweisen",
+        "bp_assign_tip": ("Speichert den aktuellen Stil (Schrift, Stil-Tab, "
+                          "Preset) auf den markierten Zeilen – diese Bubbles "
+                          "behalten ihn beim Platzieren, alle anderen nutzen "
+                          "den dann aktiven Stil."),
+        "bp_unassign": "Aktuellen Stil verwenden",
+        "bp_unassign_tip": ("Entfernt den gespeicherten Stil von den "
+                            "markierten Zeilen; sie folgen wieder dem "
+                            "aktiven Stil (Auto-Charakter-Stile werden nicht "
+                            "erneut gesetzt)."),
+        "bp_place": "Alle platzieren",
+        "bp_place_sel": "Markierte platzieren",
+        "bp_export": "Trainingsbeispiel exportieren",
+        "bp_export_tip": ("Diese Seite + die korrigierten Boxen als "
+                          "KI-Trainingsbeispiel im dataset des ai-Ordners "
+                          "speichern."),
+        "bp_pick_ai": "BubblR-'ai'-Ordner auswählen",
+        "st_bp_no_script": "Bitte zuerst ein Skript im Type-Tab laden.",
+        "st_bp_unsupported": ("Nicht unterstütztes Bild: {model}/{depth} – "
+                              "nur 8-Bit-RGBA- oder Graustufen-Dokumente "
+                              "funktionieren."),
+        "st_bp_detected": "{n} Box(en) erkannt.",
+        "st_bp_none": "Keine Bubbles erkannt.",
+        "st_bp_mismatch": ("Achtung: {b} Boxen, aber {u} Skriptzeilen – nur "
+                           "passende Paare werden platziert."),
+        "st_bp_no_sel": "Keine Auswahl – bitte zuerst eine Bubble auswählen.",
+        "st_bp_added": "Box {n} aus der Auswahl hinzugefügt.",
+        "st_bp_renumbered": "Neue Reihenfolge übernommen.",
+        "st_bp_order_mode": ("Reihenfolge festlegen: Bubbles in Lesereihen"
+                             "folge anklicken."),
+        "st_bp_sfx_mode": ("SFX markieren: Box anklicken, um zwischen "
+                           "Bubble und SFX zu wechseln."),
+        "st_bp_shape_mode": ("Form wechseln: Box anklicken, um sie rund / "
+                             "eckig zu schalten."),
+        "st_bp_edit_mode": ("Boxen bearbeiten: leer ziehen = neu, Box "
+                            "ziehen = verschieben, Ecke = Größe, Rechtsklick "
+                            "= löschen."),
+        "st_bp_panels_wait": "Panels werden erkannt (Magi)…",
+        "st_bp_panels": "Nach {n} Panel(s) neu geordnet.",
+        "st_bp_style_set": "Stil auf {n} Zeile(n) gespeichert.",
+        "st_bp_style_cleared": "Gespeicherter Stil von {n} Zeile(n) entfernt.",
+        "st_bp_no_rows": "Bitte zuerst Zeile(n) in der Tabelle markieren.",
+        "st_bp_placed": "{n} Zeile(n) platziert.",
+        "st_bp_ai_missing": ("KI-Backend nicht gefunden – einmalig "
+                             "ai\\setup.ps1 ausführen und den 'ai'-Ordner "
+                             "auswählen."),
+        "st_bp_ai_lite": ("KI-Erkennung ist im Lite-Modus aus (zu schwer für "
+                          "schwache PCs). Lite-Modus ausschalten, um sie zu "
+                          "nutzen."),
+        "st_bp_ai_error": "KI-Erkennung fehlgeschlagen: {msg}",
+        "st_bp_exported": "Trainingsbeispiel gespeichert: {name}",
+        "st_bp_export_none": "Nichts zu exportieren – erst Boxen erkennen.",
+        "view_bubblr": "BubblR-Vorschau",
+        "view_bmap": "BubblR-Tabelle",
+    },
+    # Core localization for additional UI languages; any key not listed here
+    # falls back to English via _tr().
+    "es": {
+        "title": "TypeR para Krita — Performance",
+        "language": "Idioma:",
+        "load_btn": "Cargar guion (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Guion (carga un archivo o pega directamente):",
+        "skip_empty": "Omitir líneas vacías",
+        "analyze_btn": "Analizar · emparejar JP↔EN",
+        "align_label": "Japonés  ↔  Traducción   (clic para elegir la línea)",
+        "col_source": "Japonés (origen)",
+        "col_translation": "Traducción",
+        "prev": "◀ Atrás",
+        "next": "Siguiente ▶",
+        "reset_btn": "Reiniciar progreso",
+        "font": "Fuente:",
+        "style": "Estilo:",
+        "bold": "Negrita",
+        "italic": "Cursiva",
+        "underline": "Subrayado",
+        "align": "Alineación:",
+        "align_left": "Izquierda",
+        "align_center": "Centro",
+        "align_right": "Derecha",
+        "valign_label": "Vertical:",
+        "valign_top": "Arriba",
+        "valign_middle": "Centro",
+        "valign_bottom": "Abajo",
+        "case_label": "Mayúsculas:",
+        "case_none": "Normal",
+        "case_upper": "MAYÚSCULAS",
+        "case_lower": "minúsculas",
+        "tidy": "Tipografía",
+        "round": "Globo redondo (elipse)",
+        "shadow": "Sombra",
+        "outline": "Contorno",
+        "auto": "Ajustar a la selección (tamaño + salto)",
+        "hyphenate": "Dividir palabras largas",
+        "hyph_lang": "Idioma de división:",
+        "size_max": "Tamaño máx. (px):",
+        "size_fixed": "Tamaño (px):",
+        "color_btn": "Color …",
+        "padding": "Margen interior (%):",
+        "spacing": "Interlineado (%):",
+        "page_jump": "Ir a la página:",
+        "insert_btn": "Insertar traducción  ⏎  (y siguiente)",
+    },
+    "fr": {
+        "title": "TypeR pour Krita — Performance",
+        "language": "Langue :",
+        "load_btn": "Charger le script (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Script (chargez un fichier ou collez directement) :",
+        "skip_empty": "Ignorer les lignes vides",
+        "analyze_btn": "Analyser · associer JP↔EN",
+        "align_label": "Japonais  ↔  Traduction   (clic pour choisir la ligne)",
+        "col_source": "Japonais (source)",
+        "col_translation": "Traduction",
+        "prev": "◀ Retour",
+        "next": "Suivant ▶",
+        "reset_btn": "Réinitialiser la progression",
+        "font": "Police :",
+        "style": "Style :",
+        "bold": "Gras",
+        "italic": "Italique",
+        "underline": "Souligné",
+        "align": "Alignement :",
+        "align_left": "Gauche",
+        "align_center": "Centré",
+        "align_right": "Droite",
+        "valign_label": "Vertical :",
+        "valign_top": "Haut",
+        "valign_middle": "Milieu",
+        "valign_bottom": "Bas",
+        "case_label": "Casse :",
+        "case_none": "Normal",
+        "case_upper": "MAJUSCULES",
+        "case_lower": "minuscules",
+        "tidy": "Typographie",
+        "round": "Bulle ronde (ellipse)",
+        "shadow": "Ombre",
+        "outline": "Contour",
+        "auto": "Ajuster à la sélection (taille + retour)",
+        "hyphenate": "Couper les mots longs",
+        "hyph_lang": "Langue de césure :",
+        "size_max": "Taille max. (px) :",
+        "size_fixed": "Taille (px) :",
+        "color_btn": "Couleur …",
+        "padding": "Marge intérieure (%) :",
+        "spacing": "Interligne (%) :",
+        "page_jump": "Aller à la page :",
+        "insert_btn": "Insérer la traduction  ⏎  (et suivant)",
+    },
+    "pt": {
+        "title": "TypeR para Krita — Performance",
+        "language": "Idioma:",
+        "load_btn": "Carregar roteiro (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Roteiro (carregue um arquivo ou cole direto):",
+        "skip_empty": "Ignorar linhas vazias",
+        "analyze_btn": "Analisar · parear JP↔EN",
+        "align_label": "Japonês  ↔  Tradução   (clique para escolher a linha)",
+        "col_source": "Japonês (origem)",
+        "col_translation": "Tradução",
+        "prev": "◀ Voltar",
+        "next": "Próximo ▶",
+        "reset_btn": "Reiniciar progresso",
+        "font": "Fonte:",
+        "style": "Estilo:",
+        "bold": "Negrito",
+        "italic": "Itálico",
+        "underline": "Sublinhado",
+        "align": "Alinhamento:",
+        "align_left": "Esquerda",
+        "align_center": "Centro",
+        "align_right": "Direita",
+        "valign_label": "Vertical:",
+        "valign_top": "Topo",
+        "valign_middle": "Meio",
+        "valign_bottom": "Base",
+        "case_label": "Caixa:",
+        "case_none": "Normal",
+        "case_upper": "MAIÚSCULAS",
+        "case_lower": "minúsculas",
+        "tidy": "Tipografia",
+        "round": "Balão redondo (elipse)",
+        "shadow": "Sombra",
+        "outline": "Contorno",
+        "auto": "Ajustar à seleção (tamanho + quebra)",
+        "hyphenate": "Hifenizar palavras longas",
+        "hyph_lang": "Idioma da hifenização:",
+        "size_max": "Tamanho máx. (px):",
+        "size_fixed": "Tamanho (px):",
+        "color_btn": "Cor …",
+        "padding": "Margem interna (%):",
+        "spacing": "Entrelinha (%):",
+        "page_jump": "Ir para a página:",
+        "insert_btn": "Inserir tradução  ⏎  (e próximo)",
+    },
+    "it": {
+        "title": "TypeR per Krita — Performance",
+        "language": "Lingua:",
+        "load_btn": "Carica script (.docx / .xlsx / .odt / .txt)",
+        "script_label": "Script (carica un file o incolla direttamente):",
+        "skip_empty": "Salta righe vuote",
+        "analyze_btn": "Analizza · abbina JP↔EN",
+        "align_label": "Giapponese  ↔  Traduzione   (clic per scegliere la riga)",
+        "col_source": "Giapponese (origine)",
+        "col_translation": "Traduzione",
+        "prev": "◀ Indietro",
+        "next": "Avanti ▶",
+        "reset_btn": "Azzera avanzamento",
+        "font": "Carattere:",
+        "style": "Stile:",
+        "bold": "Grassetto",
+        "italic": "Corsivo",
+        "underline": "Sottolineato",
+        "align": "Allineamento:",
+        "align_left": "Sinistra",
+        "align_center": "Centro",
+        "align_right": "Destra",
+        "valign_label": "Verticale:",
+        "valign_top": "Alto",
+        "valign_middle": "Centro",
+        "valign_bottom": "Basso",
+        "case_label": "Maiuscole:",
+        "case_none": "Normale",
+        "case_upper": "MAIUSCOLO",
+        "case_lower": "minuscolo",
+        "tidy": "Tipografia",
+        "round": "Nuvoletta tonda (ellisse)",
+        "shadow": "Ombra",
+        "outline": "Contorno",
+        "auto": "Adatta alla selezione (dimensione + a capo)",
+        "hyphenate": "Sillaba le parole lunghe",
+        "hyph_lang": "Lingua sillabazione:",
+        "size_max": "Dimensione max (px):",
+        "size_fixed": "Dimensione (px):",
+        "color_btn": "Colore …",
+        "padding": "Margine interno (%):",
+        "spacing": "Interlinea (%):",
+        "page_jump": "Vai alla pagina:",
+        "insert_btn": "Inserisci traduzione  ⏎  (e avanti)",
+    },
+}
+
+LANG_ORDER = [("en", "English"), ("de", "Deutsch"), ("es", "Español"),
+              ("fr", "Français"), ("pt", "Português"), ("it", "Italiano")]
+
+
+# ---------------------------------------------------------------------------
+# File readers  (pure standard library, no dependencies)
+# ---------------------------------------------------------------------------
+
+def _local(tag):
+    """Return a tag name without its XML namespace, e.g. '{...}p' -> 'p'."""
+    return tag.rsplit('}', 1)[-1]
+
+
+def _decode_bytes(data):
+    """Decode bytes to text without ever failing.
+
+    Order: UTF-8 (with/without BOM), then Windows-1252, finally latin-1.
+    latin-1 can map every byte and therefore never raises an exception, so a
+    "character not readable" error can never occur.
+    """
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")
+
+
+def _read_plain(path):
+    with open(path, "rb") as fh:
+        return _decode_bytes(fh.read())
+
+
+def _read_docx(path):
+    """Extract text from a .docx file.
+
+    A .docx is a ZIP; the body text lives in word/document.xml. Standalone
+    paragraphs <w:p> become one line each (<w:tab> -> tab, <w:br>/<w:cr> -> line
+    break, as before).
+
+    A TABLE is read COLUMN-AWARE: every row becomes one line whose cells are
+    separated by a TAB. That lets a two-column "source | translation" script be
+    paired by column (see langpair.split_columns), which works for ANY source
+    language – not only Japanese. Inside a cell, tabs/breaks become spaces so a
+    real TAB only ever marks a column boundary.
+    """
+    with zipfile.ZipFile(path) as zf:
+        raw = zf.read("word/document.xml")
+    root = ET.fromstring(raw)
+
+    def para_text(p, cell):
+        buf = []
+        for node in p.iter():
+            name = _local(node.tag)
+            if name == "t":
+                if node.text:
+                    buf.append(node.text)
+            elif name == "tab":
+                buf.append(" " if cell else "\t")
+            elif name in ("br", "cr"):
+                buf.append(" " if cell else "\n")
+        return "".join(buf)
+
+    def cell_text(tc):
+        # a cell may hold several paragraphs; join them with a space and keep it
+        # free of tabs/newlines so the row stays a clean TAB-separated record
+        ps = [n for n in tc.iter() if _local(n.tag) == "p"]
+        return " ".join(para_text(p, True).strip() for p in ps).strip()
+
+    lines = []
+
+    def walk(parent):
+        for child in parent:
+            name = _local(child.tag)
+            if name == "tbl":
+                for tr in child:
+                    if _local(tr.tag) != "tr":
+                        continue
+                    cells = [cell_text(tc) for tc in tr
+                             if _local(tc.tag) == "tc"]
+                    if cells:
+                        lines.append("\t".join(cells))
+            elif name == "p":
+                lines.append(para_text(child, False))
+            else:
+                walk(child)            # descend into <w:body>, content controls …
+
+    walk(root)
+    return "\n".join(lines)
+
+
+def _read_odt(path):
+    """Extract text from a .odt file (LibreOffice / OpenOffice).
+
+    A .odt is also a ZIP; the content lives in content.xml. Paragraphs are
+    <text:p> / <text:h>; line break <text:line-break>, tab <text:tab>,
+    multiple spaces <text:s>.
+    """
+    with zipfile.ZipFile(path) as zf:
+        raw = zf.read("content.xml")
+    root = ET.fromstring(raw)
+
+    def collect(elem, out):
+        # text of this node
+        if elem.text:
+            out.append(elem.text)
+        for child in elem:
+            name = _local(child.tag)
+            if name == "line-break":
+                out.append("\n")
+            elif name == "tab":
+                out.append("\t")
+            elif name == "s":
+                count = 1
+                for k, v in child.attrib.items():
+                    if _local(k) == "c":
+                        try:
+                            count = int(v)
+                        except ValueError:
+                            count = 1
+                out.append(" " * count)
+            else:
+                collect(child, out)
+            if child.tail:
+                out.append(child.tail)
+
+    lines = []
+    for para in root.iter():
+        if _local(para.tag) in ("p", "h"):
+            out = []
+            collect(para, out)
+            lines.append("".join(out))
+    return "\n".join(lines)
+
+
+def _col_index(ref):
+    """Column number from a cell reference such as 'B2' -> 2."""
+    idx = 0
+    for ch in ref:
+        if ch.isalpha():
+            idx = idx * 26 + (ord(ch.upper()) - 64)
+        else:
+            break
+    return idx
+
+
+def _read_xlsx(path):
+    """Extract text from an Excel file (.xlsx).
+
+    A .xlsx is a ZIP of XML. Text is usually stored in xl/sharedStrings.xml and
+    referenced from the cells by an index. Every non-empty cell becomes its own
+    line (row by row, left to right). If Japanese sits in one column and English
+    in the next, that produces source/translation back to back - exactly what
+    the later JP/EN pairing expects.
+    """
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            sroot = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in sroot:
+                if _local(si.tag) != "si":
+                    continue
+                parts = [t.text for t in si.iter()
+                         if _local(t.tag) == "t" and t.text]
+                shared.append("".join(parts))
+
+        sheets = sorted(n for n in names
+                        if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+        if not sheets:
+            return ""
+        wroot = ET.fromstring(zf.read(sheets[0]))
+
+        lines = []
+        for row in wroot.iter():
+            if _local(row.tag) != "row":
+                continue
+            cells = []
+            for c in row:
+                if _local(c.tag) != "c":
+                    continue
+                col = _col_index(c.attrib.get("r", ""))
+                ctype = c.attrib.get("t", "")
+                val = ""
+                if ctype == "s":
+                    for ch in c:
+                        if _local(ch.tag) == "v" and ch.text is not None:
+                            try:
+                                val = shared[int(ch.text)]
+                            except (ValueError, IndexError):
+                                val = ""
+                            break
+                elif ctype == "inlineStr":
+                    val = "".join(t.text for t in c.iter()
+                                  if _local(t.tag) == "t" and t.text)
+                else:
+                    for ch in c:
+                        if _local(ch.tag) in ("v", "t") and ch.text is not None:
+                            val = ch.text
+                            break
+                cells.append((col, val))
+            cells.sort(key=lambda cv: cv[0])
+            # one line per ROW, columns separated by a TAB, so a 2-column
+            # source/translation sheet is paired by column (works for any source
+            # language). Single-cell rows stay a plain line.
+            vals = [("" if val is None else str(val)) for _col, val in cells]
+            while vals and vals[-1].strip() == "":
+                vals.pop()
+            if not vals:
+                continue
+            lines.append("\t".join(vals) if len(vals) >= 2 else vals[0])
+        return "\n".join(lines)
+
+
+def read_script(path):
+    """Read a script file and return it as plain text (newline separated).
+
+    Deliberately raises a clear, readable exception only on real problems
+    (missing file, old .doc/.xls format), never because of individual
+    characters.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".docx":
+        return _read_docx(path)
+    if ext == ".odt":
+        return _read_odt(path)
+    if ext in (".xlsx", ".xlsm"):
+        return _read_xlsx(path)
+    if ext == ".doc":
+        raise OldDocError(".doc")
+    if ext == ".xls":
+        raise OldDocError(".xls")
+    # treat .txt, .md and everything else as plain text
+    return _read_plain(path)
+
+
+# ---------------------------------------------------------------------------
+# Line management
+# ---------------------------------------------------------------------------
+
+def split_lines(text, skip_empty):
+    """Split text into lines. \r\n and \r are normalized."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if skip_empty:
+        lines = [ln for ln in lines if ln.strip() != ""]
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Insert a text layer into Krita
+# ---------------------------------------------------------------------------
+
+def _advance(fm, s):
+    """Pixel width of a string (with a fallback for older Qt versions)."""
+    try:
+        return fm.horizontalAdvance(s)
+    except AttributeError:
+        return fm.width(s)
+
+
+def _make_measurer(family, line_spacing, bold=False, italic=False):
+    """measurer(px) -> (width_of, space_w, line_h, ascent, descent) via Qt.
+
+    Bold/italic feed into the measurement so that auto-fit accounts for the
+    actual (e.g. wider, bold) text width. width_of accepts a string OR a Word
+    object (layout): for a Word the bold runs are measured individually with
+    the matching (normal or bold) metric, so partially bold text wraps
+    correctly."""
+    def measurer(px):
+        px = max(1, int(round(px)))
+        fn = QFont(family)
+        fn.setPixelSize(px)
+        fn.setBold(bold)
+        fn.setItalic(italic)
+        fm = QFontMetricsF(fn)
+        fb = QFont(family)
+        fb.setPixelSize(px)
+        fb.setBold(True)
+        fb.setItalic(italic)
+        fmb = QFontMetricsF(fb)
+        space_w = _advance(fm, " ")
+        line_h = fm.height() * line_spacing
+
+        def width_of(x):
+            runs = getattr(x, "runs", None)
+            if runs is None:
+                if isinstance(x, (list, tuple)):
+                    runs = x          # a plain run list [(text, bold), ...]
+                else:
+                    return _advance(fm, x)   # a plain string
+            tot = 0.0
+            for (t, b) in runs:
+                tot += _advance(fmb if (bold or b) else fm, t)
+            return tot
+
+        return width_of, space_w, line_h, fm.ascent(), fm.descent()
+    return measurer
+
+
+def _hex(color):
+    return "#{:02x}{:02x}{:02x}".format(color.red(), color.green(), color.blue())
+
+
+def _text_element(text_lines, line_xs, y0, line_h, font_px, family,
+                  fill_hex, stroke_hex=None, stroke_w=0.0,
+                  bold=False, italic=False, underline=False, dx=0.0, dy=0.0):
+    """text_lines: list of run lists ([(subtext, bold), ...] per line).
+    line_xs: absolute LEFT x for each line. Lines are pre-centered/-aligned, so
+    the element uses the default 'start' anchor – Krita's text tool keeps that
+    absolute position when the shape is edited (a 'middle'/'end' anchor would be
+    dropped and the text would snap to the corner). dx/dy shift the whole block
+    (used for the offset shadow copy). Bold runs get font-weight='bold'."""
+    tspans = []
+    for i, runs in enumerate(text_lines):
+        if not runs:
+            continue
+        x = line_xs[i] + dx
+        y = y0 + dy + i * line_h
+        first = True
+        for (txt, rb) in runs:
+            weight = "bold" if (bold or rb) else "normal"
+            if first:
+                tspans.append(
+                    '<tspan x="{x:.2f}" y="{y:.2f}" font-weight="{w}">'
+                    "{txt}</tspan>".format(
+                        x=x, y=y, w=weight, txt=xml_escape(txt)))
+                first = False
+            else:
+                tspans.append(
+                    '<tspan font-weight="{w}">{txt}</tspan>'.format(
+                        w=weight, txt=xml_escape(txt)))
+    attrs = (
+        'text-anchor="start" fill="{fill}" '
+        'font-family="{fam}" font-size="{size}"'
+    ).format(fill=fill_hex, fam=xml_escape(family), size=int(round(font_px)))
+    if italic:
+        attrs += ' font-style="italic"'
+    if underline:
+        attrs += ' text-decoration="underline"'
+    if stroke_hex is not None and stroke_w > 0:
+        attrs += (
+            ' stroke="{s}" stroke-width="{w:.2f}" '
+            'stroke-linejoin="round" stroke-linecap="round"'
+        ).format(s=stroke_hex, w=stroke_w)
+    return "<text {attrs}>{spans}</text>".format(attrs=attrs, spans="".join(tspans))
+
+
+def _build_svg(text_lines, line_xs, y0, font_px, family, color, line_h, img_w, img_h,
+               outline=False, outline_color=None, outline_px=0.0,
+               bold=False, italic=False, underline=False,
+               shadow=False, shadow_color=None, shadow_dx=0.0, shadow_dy=0.0):
+    """SVG with optional shadow, optional outline and style (bold/italic/
+    underline). Alignment is baked into `line_xs` (per-line absolute x) and the
+    text uses the default 'start' anchor, so the inserted shape keeps its
+    position when edited with Krita's text tool.
+
+    Bottom-to-top order: shadow (offset copy), outline (thick line), fill.
+    Everything is drawn as extra text copies so it works independently of the
+    renderer (no filter/paint-order needed).
+    """
+    fill_hex = _hex(color)
+    body = ""
+    if shadow and shadow_color is not None and (shadow_dx or shadow_dy):
+        sh = _hex(shadow_color)
+        # the shadow takes the outline width so it keeps the full silhouette
+        sw = 2.0 * outline_px if (outline and outline_px > 0) else 0.0
+        body += _text_element(text_lines, line_xs, y0, line_h, font_px, family,
+                              fill_hex=sh,
+                              stroke_hex=(sh if sw > 0 else None), stroke_w=sw,
+                              bold=bold, italic=italic, underline=underline,
+                              dx=shadow_dx, dy=shadow_dy)
+    if outline and outline_color is not None and outline_px > 0:
+        ol = _hex(outline_color)
+        body += _text_element(text_lines, line_xs, y0, line_h, font_px, family,
+                              fill_hex=ol, stroke_hex=ol, stroke_w=2.0 * outline_px,
+                              bold=bold, italic=italic, underline=underline)
+    body += _text_element(text_lines, line_xs, y0, line_h, font_px, family,
+                          fill_hex=fill_hex,
+                          bold=bold, italic=italic, underline=underline)
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'width="{w}" height="{h}">{body}</svg>'
+    ).format(w=img_w, h=img_h, body=body)
+
+
+def tidy_text(s):
+    """Typographic clean-up: straight quotes -> curly quotes, ... -> …,
+    -- -> —, multiple spaces -> one. Makes text look more professional
+    without changing its content."""
+    s = s.replace("...", "\u2026")
+    s = re.sub(r"(?<!-)--(?!-)", "\u2014", s)
+    # opening double quote after line start / whitespace / bracket
+    s = re.sub(r'(^|[\s([{<\u2014])"', "\\1\u201c", s)
+    s = s.replace('"', "\u201d")
+    s = re.sub(r"(^|[\s([{<\u2014])'", "\\1\u2018", s)
+    s = s.replace("'", "\u2019")
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s
+
+
+def parse_bold(text):
+    """``**bold**`` marks bold sections. Returns (clean_text, mask); mask is a
+    list of bool with the same length as clean_text (True = bold). A single
+    ``*`` is kept as-is (not a marker)."""
+    clean = []
+    mask = []
+    bold = False
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "*" and i + 1 < n and text[i + 1] == "*":
+            bold = not bold
+            i += 2
+            continue
+        clean.append(text[i])
+        mask.append(bold)
+        i += 1
+    return "".join(clean), mask
+
+
+def toggle_bold(text, start, end):
+    """Add or remove bold markers (``**``) around the selection [start, end).
+    Returns (new_text, new_start, new_end). Unchanged when there is no
+    selection."""
+    if start > end:
+        start, end = end, start
+    if start == end:
+        return text, start, end
+    sel = text[start:end]
+    # markers directly outside the selection -> remove them (clear bold)
+    if text[start - 2:start] == "**" and text[end:end + 2] == "**":
+        new = text[:start - 2] + sel + text[end + 2:]
+        return new, start - 2, end - 2
+    # the selection itself is wrapped -> strip the markers
+    if sel.startswith("**") and sel.endswith("**") and len(sel) >= 4:
+        inner = sel[2:-2]
+        new = text[:start] + inner + text[end:]
+        return new, start, start + len(inner)
+    # otherwise: wrap it
+    new = text[:start] + "**" + sel + "**" + text[end:]
+    return new, start + 2, end + 2
+
+
+def prepare_text(line, case, tidy):
+    """Prepare text before setting it (order: clean up, then letter case).
+
+    case: "none" (unchanged), "upper" (UPPERCASE) or "lower" (lowercase).
+    For backward compatibility case=True behaves like "upper", case=False like
+    "none"."""
+    out = line
+    if tidy:
+        out = tidy_text(out)
+    if case is True or case == "upper":
+        out = out.upper()
+    elif case == "lower":
+        out = out.lower()
+    return out
+
+
+ALIGN_ANCHOR = {"left": "start", "center": "middle", "right": "end"}
+
+
+def _remove_existing_layers(doc, layer_index):
+    """Remove the top-level layers that TypeR inserted earlier for the 1-based
+    unit `layer_index` (matched by the exact 'TypeR NN — ' name prefix, so
+    hand-made layers are never touched). Returns the number removed; never
+    raises – a failed removal must not block the insert."""
+    removed = 0
+    try:
+        root = doc.rootNode()
+        for node in list(root.childNodes()):
+            try:
+                if L.is_typer_layer_name(node.name(), layer_index):
+                    node.remove()
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
+def insert_text_layer(line, font_family, font_px, color, auto_fit,
+                      max_px, padding_frac, line_spacing,
+                      outline=False, outline_color=None, outline_px=0.0,
+                      bold=False, italic=False, underline=False,
+                      align="center", case="none", tidy=False, shape="rect",
+                      shadow=False, shadow_color=None, shadow_dx=0.0,
+                      shadow_dy=0.0, valign="middle", layer_index=None,
+                      hyphenate=False, hyph_lang="en", replace_existing=False,
+                      box=None):
+    """Insert a single line of text as a text layer.
+
+    auto_fit=True: the line is wrapped automatically, balanced and scaled to the
+    largest size that fits the current selection (= "where to"). Without a
+    selection the whole image is used as the box.
+
+    box: optional (x, y, w, h) tuple that overrides the selection as the
+    target box — used by the BubblR tab, which places into detected bubbles
+    without touching the user's selection.
+
+    auto_fit=False: fixed size font_px, only split at embedded line breaks.
+
+    outline: optional outline in outline_color with width outline_px (pixels).
+    bold/italic/underline: font style (variant of the chosen font).
+    Individual words can be marked bold in the text with ``**...**``.
+
+    replace_existing: with a layer_index, delete the layer(s) TypeR inserted
+    earlier for the same unit before creating the new one, so re-inserting a
+    line (e.g. trying several TextShapR shapes) replaces instead of stacking.
+
+    Returns (ok, key, fmt); the caller translates key via LANG. fmt contains
+    'replaced': the number of old layers that were removed.
+    """
+    app = Krita.instance()
+    doc = app.activeDocument()
+    if doc is None:
+        return False, "st_no_doc", {}
+    if line.strip() == "":
+        return False, "st_empty_line", {}
+
+    line = prepare_text(line, case, tidy)
+    line = line.replace("\r\n", "\n").replace("\r", "\n")
+    clean, mask = parse_bold(line)
+    if clean.strip() == "":
+        return False, "st_empty_line", {}
+
+    img_w = doc.width()
+    img_h = doc.height()
+
+    # determine the box + its center (explicit box > selection > image)
+    if box is not None:
+        box_x, box_y, box_w, box_h = box
+    else:
+        sel = doc.selection()
+        has_sel = sel is not None
+        if has_sel:
+            try:
+                box_x, box_y = sel.x(), sel.y()
+                box_w, box_h = sel.width(), sel.height()
+            except Exception:
+                has_sel = False
+        if not has_sel:
+            box_x, box_y, box_w, box_h = 0, 0, img_w, img_h
+    cx = box_x + box_w / 2.0
+    cy = box_y + box_h / 2.0
+
+    measurer = _make_measurer(font_family, line_spacing, bold, italic)
+
+    if auto_fit:
+        result = L.fit_text(clean, measurer, box_w, box_h, max_px, 6,
+                            padding_frac, shape, mask,
+                            hyphenate=hyphenate, lang=hyph_lang)
+        if result is None:
+            return False, "st_empty_line", {}
+        font_px, text_lines, line_h, ascent, descent, fitted = result
+    else:
+        # fixed size, split only at embedded line breaks (run lists per line)
+        text_lines = [L.make_runs(pt, pm)
+                      for (pt, pm) in L.split_paragraphs(clean, mask)]
+        _wo, _sw, line_h, ascent, descent = measurer(font_px)
+        fitted = True
+
+    # alignment: each line gets its own absolute left x (pre-centered/-aligned)
+    # so the SVG can use the default 'start' anchor – this keeps the text in
+    # place when it's later edited with Krita's text tool (text-anchor='middle'
+    # was getting dropped, snapping the shape into the corner).
+    width_of = measurer(font_px)[0]
+    line_widths = [width_of(runs) for runs in text_lines]
+    pad_x = box_w * padding_frac / 2.0
+    line_xs = L.line_x_positions(
+        line_widths, align, box_x + pad_x, cx, box_x + box_w - pad_x)
+
+    y0 = L.vertical_start(valign, box_y, box_h, padding_frac,
+                          len(text_lines), line_h, ascent, descent)
+    svg = _build_svg(text_lines, line_xs, y0, font_px, font_family, color, line_h,
+                     img_w, img_h, outline=outline, outline_color=outline_color,
+                     outline_px=outline_px,
+                     bold=bold, italic=italic, underline=underline,
+                     shadow=shadow, shadow_color=shadow_color,
+                     shadow_dx=shadow_dx, shadow_dy=shadow_dy)
+
+    # replace mode: drop the layer(s) of an earlier insert of this unit first
+    replaced = 0
+    if replace_existing and layer_index is not None:
+        replaced = _remove_existing_layers(doc, int(layer_index))
+
+    try:
+        root = doc.rootNode()
+        snippet = (L.runs_text(text_lines[0])[:24] if text_lines else "").strip()
+        if layer_index is not None:
+            label = L.typer_layer_prefix(int(layer_index)) + snippet
+        else:
+            label = "TypeR — " + snippet
+        vlayer = doc.createVectorLayer(label)
+        root.addChildNode(vlayer, None)
+        vlayer.addShapesFromSvg(svg)
+        doc.refreshProjection()
+    except Exception as exc:  # pragma: no cover - depends on the Krita version
+        return False, "st_create_fail", {"exc": exc}
+
+    px = int(round(font_px))
+    if auto_fit and not fitted:
+        return True, "st_inserted_min", {"px": px, "replaced": replaced}
+    if auto_fit:
+        return True, "st_inserted_fit", {"px": px, "n": len(text_lines),
+                                         "replaced": replaced}
+    return True, "st_inserted", {"replaced": replaced}
+
+
+# ---------------------------------------------------------------------------
+# Font picker  (scales to thousands of fonts)
+# ---------------------------------------------------------------------------
+
+def font_match(family, query):
+    """True if the search term (case-insensitive) occurs in the family name."""
+    q = query.strip().lower()
+    return q == "" or q in family.lower()
+
+
+def order_with_recents(families, recents):
+    """Recently used fonts first, the rest in their original order."""
+    seen = set()
+    out = []
+    for r in recents:
+        if r in families and r not in seen:
+            out.append(r)
+            seen.add(r)
+    for f in families:
+        if f not in seen:
+            out.append(f)
+            seen.add(f)
+    return out
+
+
+class FontPicker(QWidget):
+    """Fast, searchable font picker.
+
+    Unlike QFontComboBox, NOT every entry is rendered in its own font (that is
+    exactly what makes QFontComboBox slow with thousands of fonts). Instead: a
+    plain text list + instant text filter, recently used fonts on top, and a
+    preview only for the currently selected font.
+    """
+
+    def __init__(self, recents=None, search_placeholder=""):
+        super().__init__()
+        self._all = list(QFontDatabase().families())
+        self._recents = [r for r in (recents or []) if r in self._all]
+        self._current = None
+
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.setLayout(lay)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText(search_placeholder)
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._apply_filter)
+        lay.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.setUniformItemSizes(True)        # faster with many items
+        self.list.setMinimumHeight(140)
+        self.list.currentItemChanged.connect(self._on_select)
+        lay.addWidget(self.list)
+
+        self.preview = QLabel("")
+        self.preview.setFrameShape(QFrame.StyledPanel)
+        self.preview.setMinimumHeight(40)
+        self.preview.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.preview)
+
+        self._rebuild()
+
+    # -- public API --
+
+    def currentFamily(self):
+        return self._current
+
+    def setCurrentFamily(self, family):
+        """Select a font programmatically (for presets). Make it visible if a
+        filter is active."""
+        if not family or family not in self._all:
+            return
+        self.search.blockSignals(True)
+        self.search.setText("")
+        self.search.blockSignals(False)
+        self._apply_filter("")
+        for i in range(self.list.count()):
+            if self.list.item(i).data(Qt.UserRole) == family:
+                self.list.setCurrentRow(i)
+                self.list.scrollToItem(self.list.item(i))
+                break
+
+    def setRecents(self, recents):
+        self._recents = [r for r in recents if r in self._all]
+
+    def noteUsed(self, family):
+        """Mark a font as recently used (after inserting)."""
+        if not family:
+            return
+        self._recents = [family] + [r for r in self._recents if r != family]
+        self._recents = self._recents[:12]
+
+    def recents(self):
+        return list(self._recents)
+
+    def set_search_placeholder(self, text):
+        self.search.setPlaceholderText(text)
+
+    # -- internal --
+
+    def _rebuild(self):
+        ordered = order_with_recents(self._all, self._recents)
+        self.list.blockSignals(True)
+        self.list.clear()
+        recents_set = set(self._recents)
+        for fam in ordered:
+            label = ("★ " + fam) if fam in recents_set else fam
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, fam)
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+        self._apply_filter(self.search.text())
+        # select the first visible row
+        for i in range(self.list.count()):
+            if not self.list.item(i).isHidden():
+                self.list.setCurrentRow(i)
+                break
+
+    def _apply_filter(self, text):
+        first_visible = None
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            fam = item.data(Qt.UserRole)
+            hide = not font_match(fam, text)
+            item.setHidden(hide)
+            if not hide and first_visible is None:
+                first_visible = i
+        cur = self.list.currentItem()
+        if (cur is None or cur.isHidden()) and first_visible is not None:
+            self.list.setCurrentRow(first_visible)
+
+    def _on_select(self, current, _previous):
+        if current is None:
+            return
+        fam = current.data(Qt.UserRole)
+        self._current = fam
+        self.preview.setText(fam + "  –  AaBb 123")
+        f = QFont(fam)
+        f.setPixelSize(20)
+        self.preview.setFont(f)
+
+
+# ---------------------------------------------------------------------------
+# Live preview
+# ---------------------------------------------------------------------------
+
+class TextPreview(QWidget):
+    """Shows a WYSIWYG preview of the active text with font, color, outline,
+    shadow, alignment and letter case – rendered in the same order as the
+    inserted layer (shadow -> outline -> fill). The font size is fitted to the
+    preview area; outline and shadow widths stay proportional to the configured
+    size so the effect matches the later result."""
+
+    _MARGIN = 10
+
+    def __init__(self, docker):
+        super().__init__()
+        self._docker = docker
+        self._text = ""
+        # Performance build: cache the expensive size-fit so geometry-only
+        # repaints (resize, focus, overlap) don't re-run the binary search.
+        # Keyed by a signature of the layout-relevant inputs; see paintEvent.
+        self._fit_sig = None
+        self._fit_cache = None          # (empty, fs, lines)
+        # Memo of hyphenation breaks per (word, lang); breaks don't depend on
+        # font size, so the binary search below can reuse them across sizes.
+        self._hyph_cache = {}
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_text(self, text):
+        self._text = text or ""
+        self.update()
+
+    # -- pull the settings from the docker --
+    def _opts(self):
+        d = self._docker
+        try:
+            family = d.font_picker.currentFamily() or ""
+        except Exception:
+            family = ""
+        align = d.align_combo.currentData() or "center"
+        valign = d.valign_combo.currentData() or "middle"
+        size_ref = max(1, d.size_spin.value())
+        return {
+            "family": family,
+            "bold": d.bold_chk.isChecked(),
+            "italic": d.italic_chk.isChecked(),
+            "underline": d.underline_chk.isChecked(),
+            "color": QColor(d._color),
+            "align": align,
+            "valign": valign,
+            "case": d.case_combo.currentData() or "none",
+            "tidy": d.tidy_chk.isChecked(),
+            "spacing": d.spacing_spin.value() / 100.0,
+            "size_ref": size_ref,
+            "outline": d.outline_chk.isChecked(),
+            "outline_color": QColor(d._outline_color),
+            "outline_px": float(d.outline_spin.value()),
+            "shadow": d.shadow_chk.isChecked(),
+            "shadow_color": QColor(d._shadow_color),
+            "shadow_dx": float(d.shadow_x_spin.value()),
+            "shadow_dy": float(d.shadow_y_spin.value()),
+            "hyphenate": d.hyph_chk.isChecked() and d.auto_chk.isChecked(),
+            "hyph_lang": d._hyph_lang_for(self._text),
+        }
+
+    def _fonts(self, o, px):
+        fn = QFont(o["family"]) if o["family"] else QFont()
+        fn.setItalic(o["italic"])
+        fn.setBold(o["bold"])
+        fn.setPixelSize(px)
+        fb = QFont(o["family"]) if o["family"] else QFont()
+        fb.setItalic(o["italic"])
+        fb.setBold(True)
+        fb.setPixelSize(px)
+        return fn, fb
+
+    def _word_w(self, word, fmn, fmb, gbold):
+        tot = 0.0
+        for (t, b) in word.runs:
+            tot += (fmb if (gbold or b) else fmn).horizontalAdvance(t)
+        return tot
+
+    def _line_w(self, words, fmn, fmb, gbold, space_w):
+        if not words:
+            return 0.0
+        return (sum(self._word_w(w, fmn, fmb, gbold) for w in words)
+                + space_w * (len(words) - 1))
+
+    def _hyph_split(self, word, avail, fmn, fmb, gbold, lang):
+        """Split `word` (preview) so the first part incl. hyphen fits `avail`;
+        latest valid break wins. Returns (left, right) or None."""
+        key = (word.text, lang)
+        breaks = self._hyph_cache.get(key)
+        if breaks is None:
+            breaks = L.hyphenate(word.text, lang)
+            self._hyph_cache[key] = breaks
+        if not breaks:
+            return None
+        best = None
+        for b in breaks:
+            left, right = L.split_word(word, b)
+            if self._word_w(left, fmn, fmb, gbold) <= avail:
+                best = (left, right)
+            else:
+                break
+        return best
+
+    def _wrap_words(self, paras, fmn, fmb, gbold, space_w, avail_w, hyph=None):
+        """Greedily wrap words (with bold runs) to width, per paragraph. With
+        `hyph` (a language code) an over-wide word is split at a syllable break,
+        so the preview matches the inserted result."""
+        lines = []
+        for words in paras:
+            if not words:
+                lines.append([])
+                continue
+            cur, cur_w = [], 0.0
+            queue = list(words)
+            guard = 0
+            while queue and guard < 100000:
+                guard += 1
+                wd = queue.pop(0)
+                ww = self._word_w(wd, fmn, fmb, gbold)
+                if not cur:
+                    if ww <= avail_w:
+                        cur, cur_w = [wd], ww
+                    else:
+                        res = (self._hyph_split(wd, avail_w, fmn, fmb, gbold, hyph)
+                               if hyph else None)
+                        if res:
+                            left, right = res
+                            lines.append([left])
+                            queue.insert(0, right)
+                            cur, cur_w = [], 0.0
+                        else:
+                            cur, cur_w = [wd], ww
+                elif cur_w + space_w + ww <= avail_w:
+                    cur.append(wd)
+                    cur_w += space_w + ww
+                else:
+                    avail = avail_w - cur_w - space_w
+                    res = (self._hyph_split(wd, avail, fmn, fmb, gbold, hyph)
+                           if hyph else None)
+                    if res:
+                        left, right = res
+                        cur.append(left)
+                        lines.append(cur)
+                        queue.insert(0, right)
+                        cur, cur_w = [], 0.0
+                    else:
+                        lines.append(cur)
+                        cur, cur_w = [wd], ww
+            if cur:
+                lines.append(cur)
+        return lines
+
+    def _fit(self, o, paras, avail_w, avail_h):
+        """Largest integer pixel size at which the wrapped words fit.
+        Returns (px, lines); lines is a list of word lists."""
+        lo, hi, best = 6, 160, 6
+        best_lines = [[]]
+        hyph = o["hyph_lang"] if o.get("hyphenate") else None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            fn, fb = self._fonts(o, mid)
+            fmn, fmb = QFontMetricsF(fn), QFontMetricsF(fb)
+            space_w = fmn.horizontalAdvance(" ")
+            line_h = fmn.height() * o["spacing"]
+            lines = self._wrap_words(paras, fmn, fmb, o["bold"], space_w,
+                                     avail_w, hyph)
+            total_h = line_h * len(lines)
+            maxw = max((self._line_w(ws, fmn, fmb, o["bold"], space_w)
+                        for ws in lines), default=0.0)
+            if total_h <= avail_h and maxw <= avail_w:
+                best, best_lines = mid, lines
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best, best_lines
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        # Lite mode skips the antialiasing hints so painting is cheaper on a
+        # weak GPU; the result is slightly coarser but the layout is identical.
+        if not self._docker._lite_mode():
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setRenderHint(QPainter.TextAntialiasing, True)
+        w, h = self.width(), self.height()
+        self._paint_background(p, w, h)
+        p.setPen(QPen(QColor(0, 0, 0, 60), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(0, 0, w - 1, h - 1)
+
+        o = self._opts()
+        m = self._MARGIN
+        avail_w = max(10, w - 2 * m)
+        avail_h = max(10, h - 2 * m)
+
+        # Reuse the cached fit when nothing layout-relevant changed. Only these
+        # fields influence wrapping / size fitting; colour, alignment, outline,
+        # shadow and underline are applied later and are cheap, so changing
+        # them must not force a re-fit.
+        sig = (self._text, avail_w, avail_h, o["family"], o["bold"],
+               o["italic"], o["case"], o["tidy"], round(o["spacing"], 4),
+               o["hyphenate"], o["hyph_lang"])
+        if sig == self._fit_sig and self._fit_cache is not None:
+            empty, fs, lines = self._fit_cache
+        else:
+            prepared = prepare_text(self._text, o["case"], o["tidy"])
+            prepared = prepared.replace("\r\n", "\n").replace("\r", "\n")
+            clean, mask = parse_bold(prepared)
+            empty = not clean.strip()
+            if empty:
+                fs, lines = 0, []
+            else:
+                paras = [L.make_words(pt, pm)
+                         for (pt, pm) in L.split_paragraphs(clean, mask)]
+                fs, lines = self._fit(o, paras, avail_w, avail_h)
+            self._fit_sig = sig
+            self._fit_cache = (empty, fs, lines)
+
+        if empty:
+            p.setPen(QColor(0, 0, 0, 110))
+            f = QFont()
+            f.setItalic(True)
+            f.setPixelSize(13)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       self._docker._tr("preview_empty"))
+            p.end()
+            return
+
+        fn, fb = self._fonts(o, fs)
+        fmn, fmb = QFontMetricsF(fn), QFontMetricsF(fb)
+        space_w = fmn.horizontalAdvance(" ")
+        line_h = fmn.height() * o["spacing"]
+        ascent = fmn.ascent()
+        block_h = line_h * len(lines)
+
+        if o["valign"] == "top":
+            y0 = m + ascent
+        elif o["valign"] == "bottom":
+            y0 = m + (avail_h - block_h) + ascent
+        else:
+            y0 = m + (avail_h - block_h) / 2.0 + ascent
+
+        scale = fs / float(o["size_ref"])
+        underline_th = max(1.0, fs * 0.06)
+        gbold = o["bold"]
+
+        path = QPainterPath()
+        for i, words in enumerate(lines):
+            line_w = self._line_w(words, fmn, fmb, gbold, space_w)
+            if o["align"] == "left":
+                x = float(m)
+            elif o["align"] == "right":
+                x = m + (avail_w - line_w)
+            else:
+                x = m + (avail_w - line_w) / 2.0
+            baseline = y0 + i * line_h
+            x_start = x
+            for wi, wd in enumerate(words):
+                if wi > 0:
+                    x += space_w
+                for (txt, b) in wd.runs:
+                    rf = fb if (gbold or b) else fn
+                    if txt:
+                        path.addText(x, baseline, rf, txt)
+                        x += (fmb if (gbold or b) else fmn).horizontalAdvance(txt)
+            if o["underline"] and words:
+                uy = baseline + max(1.0, fs * 0.12)
+                path.addRect(x_start, uy, x - x_start, underline_th)
+
+        if o["shadow"]:
+            sp = QPainterPath(path)
+            sp.translate(o["shadow_dx"] * scale, o["shadow_dy"] * scale)
+            p.fillPath(sp, QBrush(o["shadow_color"]))
+        if o["outline"] and o["outline_px"] > 0:
+            pen = QPen(o["outline_color"])
+            pen.setWidthF(max(0.5, 2.0 * o["outline_px"] * scale))
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.RoundCap)
+            p.strokePath(path, pen)
+        p.fillPath(path, QBrush(o["color"]))
+        p.end()
+
+    def _paint_background(self, p, w, h):
+        _paint_checker(p, w, h)
+
+
+def _paint_checker(p, w, h):
+    """Light-gray checkerboard (shows light and dark text colors well)."""
+    p.fillRect(0, 0, w, h, QColor(0xEE, 0xEE, 0xEE))
+    tile = 9
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(0xDB, 0xDB, 0xDB))
+    y = 0
+    row = 0
+    while y < h:
+        x = (row % 2) * tile
+        while x < w:
+            p.fillRect(x, y, tile, tile, QColor(0xDB, 0xDB, 0xDB))
+            x += 2 * tile
+        y += tile
+        row += 1
+
+
+# ---------------------------------------------------------------------------
+# TextShapR: visual picker for text-shape arrangements
+# ---------------------------------------------------------------------------
+
+class ShapeCard(QFrame):
+    """One numbered thumbnail in the TextShapR grid: a fixed arrangement of the
+    text (run lists per line) painted with the docker's current font/color/
+    effects, scaled by the shared factor `scale` so all cards are comparable."""
+
+    clicked = pyqtSignal(int)
+    W, H = 200, 120
+
+    def __init__(self, index, cand, opts, scale):
+        super().__init__()
+        self._index = index
+        self._cand = cand
+        self._o = opts
+        self._scale = scale
+        self._selected = False
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_selected(self, on):
+        if self._selected != bool(on):
+            self._selected = bool(on)
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._index)
+        super().mousePressEvent(event)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        w, h = self.width(), self.height()
+        _paint_checker(p, w, h)
+
+        o = self._o
+        s = self._scale
+        lines = self._cand["lines"]
+        fpx = max(1, int(round(self._cand["px"] * s)))
+        fn = QFont(o["family"]) if o["family"] else QFont()
+        fn.setBold(o["bold"])
+        fn.setItalic(o["italic"])
+        fn.setPixelSize(fpx)
+        fb = QFont(fn)
+        fb.setBold(True)
+        fmn, fmb = QFontMetricsF(fn), QFontMetricsF(fb)
+        line_h = fmn.height() * o["spacing"]
+
+        def run_w(runs):
+            return sum((fmb if (o["bold"] or b) else fmn).horizontalAdvance(t)
+                       for (t, b) in runs)
+
+        block_h = line_h * len(lines)
+        y0 = (h - block_h) / 2.0 + fmn.ascent()
+        path = QPainterPath()
+        underline_th = max(1.0, fpx * 0.06)
+        for i, runs in enumerate(lines):
+            lw = run_w(runs)
+            if o["align"] == "left":
+                x = 6.0
+            elif o["align"] == "right":
+                x = w - 6.0 - lw
+            else:
+                x = (w - lw) / 2.0
+            baseline = y0 + i * line_h
+            x_start = x
+            for (txt, b) in runs:
+                rf = fb if (o["bold"] or b) else fn
+                if txt:
+                    path.addText(x, baseline, rf, txt)
+                    x += (fmb if (o["bold"] or b) else fmn).horizontalAdvance(txt)
+            if o["underline"] and runs:
+                path.addRect(x_start, baseline + max(1.0, fpx * 0.12),
+                             x - x_start, underline_th)
+
+        # same bottom-to-top order as the inserted layer: shadow, outline, fill
+        if o["shadow"]:
+            sp = QPainterPath(path)
+            sp.translate(o["shadow_dx"] * s, o["shadow_dy"] * s)
+            p.fillPath(sp, QBrush(o["shadow_color"]))
+        if o["outline"] and o["outline_px"] > 0:
+            pen = QPen(o["outline_color"])
+            pen.setWidthF(max(0.5, 2.0 * o["outline_px"] * s))
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.RoundCap)
+            p.strokePath(path, pen)
+        p.fillPath(path, QBrush(o["color"]))
+
+        # number badge (top-right) + selection frame
+        p.setPen(QColor(0, 0, 0, 130))
+        bf = QFont()
+        bf.setPixelSize(11)
+        p.setFont(bf)
+        p.drawText(self.rect().adjusted(0, 3, -6, 0),
+                   Qt.AlignRight | Qt.AlignTop, str(self._index + 1))
+        frame = QPen(QColor(0x2D, 0x8C, 0xEB), 2) if self._selected \
+            else QPen(QColor(0, 0, 0, 70), 1)
+        p.setPen(frame)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(1, 1, w - 2, h - 2)
+        p.end()
+
+
+class TextShapRDialog(QDialog):
+    """Modal picker: shows the current line wrapped into several candidate
+    shapes (mode bar: Balanced / Round / Tall / Wide, plus a Hyphenation
+    toggle) as numbered thumbnails. Click selects; Apply inserts the chosen
+    arrangement through the normal insert path; Apply + next also advances.
+    Number keys select a card, Shift+number applies and advances."""
+
+    _MODES = ("balanced", "round", "tall", "wide")
+
+    def __init__(self, docker):
+        super().__init__(docker.widget())
+        self._docker = docker
+        t = docker._tr
+        self.setWindowTitle(t("shaper_title"))
+        self.resize(470, 620)
+
+        lay = QVBoxLayout()
+        self.setLayout(lay)
+
+        bar = QHBoxLayout()
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        for i, mode in enumerate(self._MODES):
+            b = QPushButton(t("shaper_" + mode))
+            b.setCheckable(True)
+            if i == 0:
+                b.setChecked(True)
+            self._mode_group.addButton(b, i)
+            bar.addWidget(b)
+        self._mode_group.buttonClicked.connect(lambda *_a: self._refresh())
+        # hyphenation is a toggle on top of the mode, not exclusive with it
+        self.hyph_btn = QPushButton(t("shaper_hyph"))
+        self.hyph_btn.setCheckable(True)
+        self.hyph_btn.setChecked(docker.hyph_chk.isChecked())
+        self.hyph_btn.toggled.connect(lambda *_a: self._refresh())
+        bar.addWidget(self.hyph_btn)
+        lay.addLayout(bar)
+
+        self._grid_host = QWidget()
+        self._grid = QGridLayout()
+        self._grid.setSpacing(8)
+        self._grid_host.setLayout(self._grid)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.StyledPanel)
+        scroll.setWidget(self._grid_host)
+        lay.addWidget(scroll, 1)
+
+        self._empty = QLabel(t("shaper_empty"))
+        self._empty.setWordWrap(True)
+        self._empty.setAlignment(Qt.AlignCenter)
+        self._grid.addWidget(self._empty, 0, 0, 1, 2)
+
+        self._hint = QLabel(t("shaper_hint"))
+        self._hint.setStyleSheet("color: gray;")
+        self._hint.setWordWrap(True)
+        lay.addWidget(self._hint)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self.apply_btn = QPushButton(t("shaper_apply"))
+        self.apply_btn.clicked.connect(lambda: self._apply(False))
+        foot.addWidget(self.apply_btn)
+        self.apply_next_btn = QPushButton(t("shaper_apply_next"))
+        self.apply_next_btn.setDefault(True)
+        self.apply_next_btn.clicked.connect(lambda: self._apply(True))
+        foot.addWidget(self.apply_next_btn)
+        self.close_btn = QPushButton(t("close"))
+        self.close_btn.clicked.connect(self.reject)
+        foot.addWidget(self.close_btn)
+        lay.addLayout(foot)
+
+        self._cards = []
+        self._cands = []
+        self._sel = -1
+        self._refresh()
+
+    # -- data --
+
+    def _box(self):
+        """Box to fit into: the selection, else the whole image, else a
+        default box (no document open). Returns (w, h, has_doc)."""
+        try:
+            doc = Krita.instance().activeDocument()
+        except Exception:
+            doc = None
+        if doc is None:
+            return 400.0, 300.0, False
+        sel = doc.selection()
+        if sel is not None:
+            try:
+                w, h = float(sel.width()), float(sel.height())
+                if w > 0 and h > 0:
+                    return w, h, True
+            except Exception:
+                pass
+        return float(doc.width()), float(doc.height()), True
+
+    def _opts(self):
+        d = self._docker
+        return {
+            "family": d.font_picker.currentFamily() or "",
+            "bold": d.bold_chk.isChecked(),
+            "italic": d.italic_chk.isChecked(),
+            "underline": d.underline_chk.isChecked(),
+            "color": QColor(d._color),
+            "align": d.align_combo.currentData() or "center",
+            "spacing": d.spacing_spin.value() / 100.0,
+            "outline": d.outline_chk.isChecked(),
+            "outline_color": QColor(d._outline_color),
+            "outline_px": float(d.outline_spin.value()),
+            "shadow": d.shadow_chk.isChecked(),
+            "shadow_color": QColor(d._shadow_color),
+            "shadow_dx": float(d.shadow_x_spin.value()),
+            "shadow_dy": float(d.shadow_y_spin.value()),
+        }
+
+    def _refresh(self):
+        """Regenerate the candidates for the current line and rebuild the
+        cards. Never raises; with no font/text it shows a hint instead."""
+        d = self._docker
+        for card in self._cards:
+            self._grid.removeWidget(card)
+            card.deleteLater()
+        self._cards = []
+        self._cands = []
+        self._sel = -1
+
+        family = d.font_picker.currentFamily()
+        prepared = prepare_text(d._current_text(),
+                                d.case_combo.currentData() or "none",
+                                d.tidy_chk.isChecked())
+        prepared = prepared.replace("\r\n", "\n").replace("\r", "\n")
+        clean, mask = parse_bold(prepared)
+        box_w, box_h, has_doc = self._box()
+
+        if family and clean.strip():
+            measurer = _make_measurer(family,
+                                      d.spacing_spin.value() / 100.0,
+                                      d.bold_chk.isChecked(),
+                                      d.italic_chk.isChecked())
+            mode = self._MODES[max(0, self._mode_group.checkedId())]
+            try:
+                self._cands = L.shape_candidates(
+                    clean, measurer, box_w, box_h,
+                    d.size_spin.value(), 6, d.pad_spin.value() / 100.0,
+                    mode=mode, hyphenate=self.hyph_btn.isChecked(),
+                    lang=d._hyph_lang_for(clean), mask=mask, limit=10)
+            except Exception:
+                self._cands = []
+
+        have = bool(self._cands)
+        self._empty.setVisible(not have)
+        self.apply_btn.setEnabled(have)
+        self.apply_next_btn.setEnabled(have)
+        self._hint.setText(self._docker._tr(
+            "shaper_hint" if has_doc else "shaper_no_doc"))
+        if not have:
+            return
+        o = self._opts()
+        # one shared scale so the size differences between shapes stay visible
+        scale = min((ShapeCard.W - 12) / box_w, (ShapeCard.H - 12) / box_h)
+        for i, cand in enumerate(self._cands):
+            card = ShapeCard(i, cand, o, scale)
+            card.clicked.connect(self._select)
+            self._grid.addWidget(card, i // 2, i % 2)
+            self._cards.append(card)
+        self._select(0)
+
+    # -- interaction --
+
+    def _select(self, index):
+        if not (0 <= index < len(self._cards)):
+            return
+        self._sel = index
+        for i, card in enumerate(self._cards):
+            card.set_selected(i == index)
+
+    def _apply(self, advance):
+        if not (0 <= self._sel < len(self._cands)):
+            return
+        ok = self._docker.insert_arrangement(self._cands[self._sel], advance)
+        if ok and advance:
+            self._refresh()        # show the shapes for the next line
+
+    @staticmethod
+    def _digit(event):
+        """Digit 0-9 of a key event, robust against Shift (which turns the key
+        into a symbol on most layouts). None if not a digit key."""
+        vk = event.nativeVirtualKey()      # Windows/X11: VK stays '0'..'9'
+        if 0x30 <= vk <= 0x39:
+            return vk - 0x30
+        k = event.key()
+        if Qt.Key_0 <= k <= Qt.Key_9:
+            return k - Qt.Key_0
+        return None
+
+    def keyPressEvent(self, event):
+        digit = self._digit(event)
+        if digit is not None:
+            index = 9 if digit == 0 else digit - 1       # key 0 = card 10
+            if 0 <= index < len(self._cards):
+                self._select(index)
+                if event.modifiers() & Qt.ShiftModifier:
+                    self._apply(True)
+            return
+        super().keyPressEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Movable panel wrapper (customizable layout, step 2a)
+# ---------------------------------------------------------------------------
+
+class FlowLayout(QLayout):
+    """A layout that lays widgets out left-to-right and wraps to the next line
+    when they don't fit the available width (Qt's classic flow-layout example).
+
+    Used for the BubblR control rows so the buttons/fields reflow to the
+    docker width instead of overflowing off the right edge."""
+
+    def __init__(self, margin=0, spacing=4):
+        super(FlowLayout, self).__init__()
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super(FlowLayout, self).setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_h = 0
+        space = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            w, h = hint.width(), hint.height()
+            if x + w > right and line_h > 0:      # wrap to next line
+                x = rect.x() + m.left()
+                y = y + line_h + space
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += w + space
+            line_h = max(line_h, h)
+        return y + line_h - rect.y() + m.bottom()
+
+
+class PanelBox(QFrame):
+    """A relocatable panel: a small header bar (title + a ⋮ menu that moves
+    the panel to another tab) above its content. The header only shows in
+    "Customize layout" mode, so in normal use the panel looks like plain
+    content. The docker owns the actual move logic (`_move_panel_to_tab`)."""
+
+    def __init__(self, pid, docker):
+        super(PanelBox, self).__init__()
+        self._pid = pid
+        self._docker = docker
+        self._edit = False
+        self._locked = False           # pinned: excluded from dragging
+        self._drag_pos = None          # press point on the header (drag start)
+        self._drop_zone = None         # "top"/"bottom" while a panel hovers
+        # declared early: event filters below can fire during construction
+        self._resize_grip = None
+        self._resize_ref = None
+        self._user_height = 0
+        self.setFrameShape(QFrame.NoFrame)
+        self.setAcceptDrops(True)      # a panel can be dropped onto this one
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(1)
+        self._header = QWidget()
+        h = QHBoxLayout(self._header)
+        h.setContentsMargins(4, 0, 2, 0)
+        h.setSpacing(2)
+        # A grip glyph hints the header is a drag handle in customize mode.
+        self._grip = QLabel("⠿")
+        self._grip.setStyleSheet("color: palette(mid);")
+        h.addWidget(self._grip)
+        self._title = QLabel()
+        self._title.setStyleSheet("color: palette(mid); font-weight: bold;")
+        h.addWidget(self._title, 1)
+        # padlock: pin a panel so it can't be dragged even in customize mode
+        self._lock_btn = QToolButton()
+        self._lock_btn.setAutoRaise(True)
+        self._lock_btn.setCheckable(True)
+        self._lock_btn.setText("🔓")
+        self._lock_btn.toggled.connect(
+            lambda on: self._docker._set_panel_locked(self._pid, on))
+        h.addWidget(self._lock_btn)
+        self._menu_btn = QToolButton()
+        self._menu_btn.setText("⋮")
+        self._menu_btn.setAutoRaise(True)
+        self._menu_btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self._menu_btn)
+        menu.aboutToShow.connect(self._build_menu)
+        self._menu = menu
+        self._menu_btn.setMenu(menu)
+        h.addWidget(self._menu_btn)
+        v.addWidget(self._header)
+        # The header (title + grip) is the drag handle. Watch its mouse events.
+        self._header.installEventFilter(self)
+        self._title.installEventFilter(self)
+        self._grip.installEventFilter(self)
+        self._header.setCursor(Qt.OpenHandCursor)
+        self.body = QWidget()
+        self._body_lay = QVBoxLayout(self.body)
+        self._body_lay.setContentsMargins(0, 0, 0, 0)
+        self._body_lay.setSpacing(6)
+        v.addWidget(self.body, 1)
+        # resize handle along the bottom edge, shown only in Customize mode;
+        # drag it to set the panel's height (persisted by the docker).
+        self._resize_grip = QWidget()
+        self._resize_grip.setFixedHeight(7)
+        self._resize_grip.setCursor(Qt.SizeVerCursor)
+        self._resize_grip.setStyleSheet(
+            "background: palette(mid); border-radius: 2px;")
+        self._resize_grip.setVisible(False)
+        self._resize_grip.installEventFilter(self)
+        v.addWidget(self._resize_grip)
+        self._user_height = 0          # 0 = natural size, >0 = fixed height
+        self._resize_ref = None
+        self._header.setVisible(False)
+
+    def body_layout(self):
+        return self._body_lay
+
+    def set_title(self, text):
+        self._title.setText(text)
+
+    def set_edit(self, on):
+        self._edit = bool(on)
+        self._header.setVisible(self._edit)
+        self._resize_grip.setVisible(self._edit)
+        self._apply_frame()
+
+    def set_user_height(self, h):
+        """Fix the panel height to `h` px (0 = back to natural sizing)."""
+        self._user_height = int(h) if h and h > 0 else 0
+        if self._user_height > 0:
+            self.setMinimumHeight(self._user_height)
+            self.setMaximumHeight(self._user_height)
+        else:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+
+    def set_locked(self, on):
+        """Pin/unpin the panel (reflects docker state; does not re-save)."""
+        self._locked = bool(on)
+        self._lock_btn.blockSignals(True)
+        self._lock_btn.setChecked(self._locked)
+        self._lock_btn.setText("🔒" if self._locked else "🔓")
+        self._lock_btn.blockSignals(False)
+        self._header.setCursor(
+            Qt.ForbiddenCursor if self._locked else Qt.OpenHandCursor)
+
+    def _apply_frame(self):
+        self.setFrameShape(QFrame.StyledPanel if self._edit else QFrame.NoFrame)
+        if self._edit and self._drop_zone == "top":
+            self.setStyleSheet("PanelBox { border-top: 2px solid palette(highlight); }")
+        elif self._edit and self._drop_zone == "bottom":
+            self.setStyleSheet("PanelBox { border-bottom: 2px solid palette(highlight); }")
+        else:
+            self.setStyleSheet("")
+
+    def _build_menu(self):
+        self._menu.clear()
+        self._docker._fill_panel_menu(self._menu, self._pid)
+
+    # -- drag source (drag the header to relocate the panel) ----------------
+
+    def eventFilter(self, obj, ev):
+        if obj is self._resize_grip and self._edit:
+            et = ev.type()
+            if et == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+                self._resize_ref = (ev.globalPos().y(), self.height())
+                return True
+            if et == QEvent.MouseMove and self._resize_ref is not None:
+                dy = ev.globalPos().y() - self._resize_ref[0]
+                self.set_user_height(max(80, self._resize_ref[1] + dy))
+                return True
+            if et == QEvent.MouseButtonRelease and self._resize_ref is not None:
+                self._resize_ref = None
+                self._docker._save_panel_heights()
+                return True
+        if (obj in (self._header, self._title, self._grip)
+                and self._edit and not self._locked):
+            et = ev.type()
+            if et == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+                self._drag_pos = ev.pos()
+            elif et == QEvent.MouseMove and self._drag_pos is not None:
+                if ((ev.pos() - self._drag_pos).manhattanLength()
+                        >= QApplication.startDragDistance()):
+                    self._drag_pos = None
+                    self._start_drag()
+                    return True
+            elif et == QEvent.MouseButtonRelease:
+                self._drag_pos = None
+        return super(PanelBox, self).eventFilter(obj, ev)
+
+    def _start_drag(self):
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(PANEL_MIME, self._pid.encode("utf-8"))
+        drag.setMimeData(mime)
+        pm = self.grab()
+        if pm.width() > 320:
+            pm = pm.scaledToWidth(320, Qt.SmoothTransformation)
+        drag.setPixmap(pm)
+        drag.setHotSpot(QPoint(20, 10))
+        self._docker._panel_drag_started()
+        drag.exec_(Qt.MoveAction)
+        self._docker._panel_drag_finished()
+
+    # -- drop target (another panel dropped onto this one) ------------------
+
+    def dragEnterEvent(self, ev):
+        if self._edit and ev.mimeData().hasFormat(PANEL_MIME):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev):
+        if not (self._edit and ev.mimeData().hasFormat(PANEL_MIME)):
+            ev.ignore()
+            return
+        zone = "top" if ev.pos().y() < self.height() / 2 else "bottom"
+        if zone != self._drop_zone:
+            self._drop_zone = zone
+            self._apply_frame()
+        ev.acceptProposedAction()
+
+    def dragLeaveEvent(self, ev):
+        if self._drop_zone is not None:
+            self._drop_zone = None
+            self._apply_frame()
+
+    def dropEvent(self, ev):
+        after = self._drop_zone == "bottom"
+        self._drop_zone = None
+        self._apply_frame()
+        if not (self._edit and ev.mimeData().hasFormat(PANEL_MIME)):
+            ev.ignore()
+            return
+        src = bytes(ev.mimeData().data(PANEL_MIME)).decode("utf-8")
+        self._docker._drop_panel_rel(src, self._pid, after)
+        ev.acceptProposedAction()
+
+
+# ---------------------------------------------------------------------------
+# Detach host dockers
+# ---------------------------------------------------------------------------
+
+class TyperExtraHost(DockWidget):
+    """A generic host docker for a *detached* TypeR panel. Krita only shows
+    dockers registered at startup, so a small pool of these is pre-registered
+    (see :func:`register`). They stay empty until the user detaches a panel
+    into one; each registers itself in ``_EXTRA_HOSTS`` by its slot so the
+    main docker can find a free host."""
+
+    _SLOT = 0     # overridden per registered subclass
+
+    def __init__(self):
+        super(TyperExtraHost, self).__init__()
+        slot = self.__class__._SLOT
+        self._slot = slot
+        self.setWindowTitle("TypeR panel %d" % (slot + 1))
+        host = QWidget()
+        self._lay = QVBoxLayout(host)
+        self._lay.setContentsMargins(4, 4, 4, 4)
+        self._lay.setSpacing(4)
+        self._placeholder = QLabel("")
+        self._placeholder.setStyleSheet("color: gray;")
+        self._placeholder.setWordWrap(True)
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._lay.addWidget(self._placeholder)
+        self._lay.addStretch(1)
+        self.setWidget(host)
+        _EXTRA_HOSTS[slot] = self
+
+    def host_layout(self):
+        return self._lay
+
+    def set_hint(self, text):
+        self._placeholder.setText(text)
+
+    def show_placeholder(self, on):
+        self._placeholder.setVisible(bool(on))
+
+    def canvasChanged(self, canvas):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Docker UI
+# ---------------------------------------------------------------------------
+
+class TyperDocker(DockWidget):
+
+    def __init__(self):
+        super().__init__()
+
+        self._pairs = []
+        self._pair_pages = []        # page label per unit (parallel to _pairs)
+        self._pages = []             # ordered (label, first_unit_index)
+        self._index = 0
+        self._done = set()
+        self._color = QColor(0, 0, 0)
+        self._outline_color = QColor(255, 255, 255)
+        self._shadow_color = QColor(0, 0, 0)
+        self._lang = self._load_lang()
+        self._groups = self._load_groups()
+        self._group = ""
+        self._char = ""
+        self._script_path = ""             # file name of the active script
+        self._preset_usage = self._load_preset_usage()
+        # Multiple loaded scripts ("tabs"). Each session is a dict with a unique
+        # id; the QTabBar stores that id as tab data, so tab order and the
+        # session list stay decoupled (reordering tabs is harmless). The live
+        # self._pairs/_index/_done/… always mirror the ACTIVE session and are
+        # snapshotted back into it on every tab switch/close.
+        self._sessions = []
+        self._active_sid = None
+        self._next_sid = 1
+
+        # --- performance build ------------------------------------------------
+        # "Lite mode" for weak PCs: no live preview (manual refresh instead),
+        # no anti-aliasing, and the AI detector is never invoked. Persisted;
+        # this build defaults it ON. See _lite_mode / _update_text_preview.
+        try:
+            self._lite = (Krita.instance().readSetting(
+                "typer_perf", "liteMode", "true") != "false")
+        except Exception:
+            self._lite = True
+        self._preview_dirty = False
+        # Debounce timer: rapid edits (typing, dragging a spin box) restart it
+        # and only the final tick repaints the preview, instead of one full
+        # size-fitting re-layout per event.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120)
+        self._preview_timer.timeout.connect(self._do_update_text_preview)
+
+        # The docker is organized into four top-level tabs so the everyday
+        # workflow (Type: script -> line -> bubble -> font -> insert) stays
+        # uncluttered; styling, presets and setup are one click away. Each
+        # page scrolls on its own so nothing ever squishes or clips.
+        main = QWidget()
+        outer = QVBoxLayout()
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(4)
+        main.setLayout(outer)
+
+        self.main_tabs = QTabWidget()
+        outer.addWidget(self.main_tabs, 1)
+
+        def _page():
+            page = QWidget()
+            lay = QVBoxLayout()
+            lay.setContentsMargins(8, 8, 8, 8)
+            lay.setSpacing(6)
+            page.setLayout(lay)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(page)
+            self.main_tabs.addTab(scroll, "")
+            return lay
+
+        lay_type = _page()       # everyday insert loop
+        lay_style = _page()      # font variants, alignment, effects, fitting
+        lay_setup = _page()      # language + panel layout
+
+        # Presets are no longer their own tab: they live inside the Type
+        # tab as a self-contained panel container. Building them into this
+        # container's layout keeps every `lay_presets.addWidget(...)` call
+        # below unchanged; the container is inserted into the Type tab.
+        self.presets_panel = QWidget()
+        lay_presets = QVBoxLayout()
+        lay_presets.setContentsMargins(0, 0, 0, 0)
+        lay_presets.setSpacing(6)
+        self.presets_panel.setLayout(lay_presets)
+
+        # movable-panel registry (customizable layout, step 2a)
+        self._tab_layouts = {"type": lay_type, "style": lay_style,
+                             "setup": lay_setup}
+        self._panels = {}          # panel id -> PanelBox
+        self._panel_tab = {}       # panel id -> current tab id
+        self._panel_home = {}      # panel id -> default (home) tab id
+        self._detached = {}        # panel id -> slot int, or "float"
+        self._float_dialogs = {}   # panel id -> floating QDialog (fallback)
+
+        # --- general settings panel (language + insert/preset options) ---
+        _sg_pb = self._new_panel("setup_general", "setup")
+        _sgl = _sg_pb.body_layout()
+        lang_row = QHBoxLayout()
+        self.lang_label = QLabel()
+        self.lang_combo = NoScrollComboBox()
+        for code, name in LANG_ORDER:
+            self.lang_combo.addItem(name, code)
+        start = 0
+        for i, (code, _name) in enumerate(LANG_ORDER):
+            if code == self._lang:
+                start = i
+        self.lang_combo.setCurrentIndex(start)
+        self.lang_combo.currentIndexChanged.connect(self._on_lang_change)
+        lang_row.addWidget(self.lang_label)
+        lang_row.addWidget(self.lang_combo, 1)
+        _sgl.addLayout(lang_row)
+        # replace the layer(s) of an earlier insert when a line is re-inserted
+        self.replace_chk = QCheckBox()
+        self.replace_chk.setChecked(self._load_replace_existing())
+        self.replace_chk.toggled.connect(self._on_replace_toggle)
+        _sgl.addWidget(self.replace_chk)
+        # presets: with a character level (default) or one flat list per manga
+        self.by_char_chk = QCheckBox()
+        self.by_char_chk.setChecked(self._load_by_char())
+        self.by_char_chk.toggled.connect(self._on_by_char_toggle)
+        _sgl.addWidget(self.by_char_chk)
+        lay_setup.addWidget(_sg_pb)
+
+        # --- collapsible "Layout & sizes" panel ---
+        # Lets the user resize or hide the big parts of the docker (preview,
+        # script box, JP/EN table, font list) and remembers it across restarts.
+        _lz_pb = self._new_panel("layout_sizes", "setup")
+        _lzl = _lz_pb.body_layout()
+        v = self._load_view()
+        defaults = self._view_defaults()
+        for k, dv in defaults.items():
+            v.setdefault(k, dv)
+
+        self.view_toggle = QPushButton()
+        self.view_toggle.setCheckable(True)
+        self.view_toggle.setChecked(bool(v["open"]))
+        _lzl.addWidget(self.view_toggle)
+
+        self.view_box = QWidget()
+        view_lay = QVBoxLayout()
+        view_lay.setContentsMargins(6, 2, 6, 2)
+        view_lay.setSpacing(4)
+        self.view_box.setLayout(view_lay)
+        self.view_hint = QLabel()
+        self.view_hint.setStyleSheet("color: gray;")
+        self.view_hint.setWordWrap(True)
+        view_lay.addWidget(self.view_hint)
+        view_grid = QGridLayout()
+        view_grid.setHorizontalSpacing(8)
+
+        def _view_row(r, chk_attr, spin_attr, lo, hi, val, show):
+            chk = QCheckBox()
+            chk.setChecked(bool(show))
+            spin = NoScrollSpinBox()
+            spin.setRange(lo, hi)
+            spin.setSingleStep(10)
+            spin.setValue(int(val))
+            spin.setSuffix(" px")
+            setattr(self, chk_attr, chk)
+            setattr(self, spin_attr, spin)
+            view_grid.addWidget(chk, r, 0)
+            view_grid.addWidget(spin, r, 1)
+
+        _view_row(0, "v_preview_chk", "v_preview_h", 40, 1200,
+                  v["preview_h"], v["preview_show"])
+        _view_row(1, "v_editor_chk", "v_editor_h", 40, 1200,
+                  v["editor_h"], v["editor_show"])
+        _view_row(2, "v_table_chk", "v_table_h", 60, 1600,
+                  v["table_h"], v["table_show"])
+        _view_row(3, "v_fonts_chk", "v_fonts_h", 40, 1200,
+                  v["fonts_h"], v["fonts_show"])
+        view_grid.setColumnStretch(0, 1)
+        view_lay.addLayout(view_grid)
+        self.view_reset_btn = QPushButton()
+        self.view_reset_btn.clicked.connect(self._on_view_reset)
+        view_lay.addWidget(self.view_reset_btn)
+        _lzl.addWidget(self.view_box)
+        lay_setup.addWidget(_lz_pb)
+
+        # --- collapsible "Experimental" section ---
+        # Groups the not-yet-final features: enabling/disabling BubblR and
+        # TextShapR, and the customizable layout (rename/reorder tabs; panel
+        # drag/detach follows in a later phase).
+        app = Krita.instance()
+        self.exp_toggle = QPushButton()
+        self.exp_toggle.setCheckable(True)
+        self.exp_toggle.setChecked(
+            app.readSetting("typer_perf", "expOpen", "false") == "true")
+        self.exp_toggle.toggled.connect(self._on_exp_toggle)
+        lay_setup.addWidget(self.exp_toggle)
+
+        self.exp_box = QWidget()
+        exp_lay = QVBoxLayout()
+        exp_lay.setContentsMargins(6, 2, 6, 2)
+        exp_lay.setSpacing(4)
+        self.exp_box.setLayout(exp_lay)
+
+        # enable/disable the TextShapR button
+        self.enable_shapr_chk = QCheckBox()
+        self.enable_shapr_chk.setChecked(
+            app.readSetting("typer_perf", "enableShapr", "true") == "true")
+        self.enable_shapr_chk.toggled.connect(self._on_enable_shapr)
+        exp_lay.addWidget(self.enable_shapr_chk)
+
+        exp_lay.addWidget(self._hline())
+        self.customize_chk = QCheckBox()
+        self.customize_chk.setChecked(
+            app.readSetting("typer_perf", "customize", "false") == "true")
+        self.customize_chk.toggled.connect(self._on_customize_toggle)
+        exp_lay.addWidget(self.customize_chk)
+        self.customize_hint = QLabel()
+        self.customize_hint.setWordWrap(True)
+        self.customize_hint.setStyleSheet("color: gray;")
+        self.customize_hint.setVisible(self.customize_chk.isChecked())
+        exp_lay.addWidget(self.customize_hint)
+        self.layout_reset_btn = QPushButton()
+        self.layout_reset_btn.clicked.connect(self.on_layout_reset)
+        exp_lay.addWidget(self.layout_reset_btn)
+
+        lay_setup.addWidget(self.exp_box)
+        self.exp_box.setVisible(self.exp_toggle.isChecked())
+        lay_setup.addStretch(1)
+        self.view_box.setVisible(self.view_toggle.isChecked())
+
+        # wire up after the initial values are set, so nothing fires early
+        self.view_toggle.toggled.connect(self._on_view_toggle)
+        for _w in (self.v_preview_chk, self.v_editor_chk, self.v_table_chk,
+                   self.v_fonts_chk):
+            _w.toggled.connect(self._on_view_changed)
+        for _w in (self.v_preview_h, self.v_editor_h, self.v_table_h,
+                   self.v_fonts_h):
+            _w.valueChanged.connect(self._on_view_changed)
+
+        # --- presets (Presets tab) ---
+        self.lbl_preset = QLabel()
+        lay_presets.addWidget(self.lbl_preset)
+        group_row = QHBoxLayout()
+        self.lbl_group = QLabel()
+        group_row.addWidget(self.lbl_group)
+        self.group_combo = NoScrollComboBox()
+        self.group_combo.currentIndexChanged.connect(self._on_group_selected)
+        group_row.addWidget(self.group_combo, 1)
+        self.group_new_btn = QPushButton()
+        self.group_new_btn.clicked.connect(self.on_group_new)
+        self.group_del_btn = QPushButton()
+        self.group_del_btn.clicked.connect(self.on_group_delete)
+        group_row.addWidget(self.group_new_btn)
+        group_row.addWidget(self.group_del_btn)
+        lay_presets.addLayout(group_row)
+        char_row = QHBoxLayout()
+        self.lbl_char = QLabel()
+        char_row.addWidget(self.lbl_char)
+        self.char_combo = NoScrollComboBox()
+        self.char_combo.currentIndexChanged.connect(self._on_char_selected)
+        char_row.addWidget(self.char_combo, 1)
+        self.char_new_btn = QPushButton()
+        self.char_new_btn.clicked.connect(self.on_char_new)
+        self.char_del_btn = QPushButton()
+        self.char_del_btn.clicked.connect(self.on_char_delete)
+        char_row.addWidget(self.char_new_btn)
+        char_row.addWidget(self.char_del_btn)
+        lay_presets.addLayout(char_row)
+        # Auto-pick character from a "Name:" speaker prefix (optional)
+        self.auto_char_chk = QCheckBox()
+        self.auto_char_chk.setChecked(self._load_auto_char())
+        self.auto_char_chk.toggled.connect(self._on_auto_char_toggle)
+        lay_presets.addWidget(self.auto_char_chk)
+        # Auto-pick manga from the script's file name / header / first lines
+        self.auto_manga_chk = QCheckBox()
+        self.auto_manga_chk.setChecked(self._load_auto_manga())
+        self.auto_manga_chk.toggled.connect(self._on_auto_manga_toggle)
+        lay_presets.addWidget(self.auto_manga_chk)
+        preset_row = QHBoxLayout()
+        self.preset_combo = NoScrollComboBox()
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        preset_row.addWidget(self.preset_combo, 1)
+        # the rarely-used preset actions live in one compact "⋯" menu instead
+        # of two full button rows
+        self.preset_menu_btn = QToolButton()
+        self.preset_menu_btn.setText("⋯")
+        self.preset_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        preset_menu = QMenu(self.preset_menu_btn)
+        self.preset_save_act = preset_menu.addAction("")
+        self.preset_save_act.triggered.connect(self.on_preset_save)
+        self.preset_del_act = preset_menu.addAction("")
+        self.preset_del_act.triggered.connect(self.on_preset_delete)
+        preset_menu.addSeparator()
+        self.preset_import_act = preset_menu.addAction("")
+        self.preset_import_act.triggered.connect(self.on_preset_import)
+        self.preset_export_act = preset_menu.addAction("")
+        self.preset_export_act.triggered.connect(self.on_preset_export)
+        self.preset_menu_btn.setMenu(preset_menu)
+        preset_row.addWidget(self.preset_menu_btn)
+        lay_presets.addLayout(preset_row)
+        # (no trailing stretch: this is a compact panel inside the Type tab)
+
+        # --- load a file + script input (Type tab) ---
+        # Wrapped as one movable "script" panel (load button, script tabs,
+        # the parsed-text editor and the analyze row) so it can be reordered
+        # relative to the presets / preview / table panels.
+        _script_pb = self._new_panel("script_box", "type")
+        _slay = _script_pb.body_layout()
+        self.load_btn = QPushButton()
+        self.load_btn.clicked.connect(self.on_load)
+        _slay.addWidget(self.load_btn)
+
+        # Generously sized so the parsed/pasted script is easy to read and edit.
+        self.lbl_script = QLabel()
+        _slay.addWidget(self.lbl_script)
+        # Tabs for several loaded scripts (browser-style: closable + middle-click,
+        # reorderable, eliding long names, with scroll buttons in a narrow dock).
+        self.script_tabs = ScriptTabBar()
+        self.script_tabs.setTabsClosable(True)
+        self.script_tabs.setMovable(True)
+        self.script_tabs.setExpanding(False)
+        self.script_tabs.setDrawBase(False)
+        self.script_tabs.setElideMode(Qt.ElideMiddle)
+        self.script_tabs.setUsesScrollButtons(True)
+        self.script_tabs.currentChanged.connect(self._on_tab_changed)
+        self.script_tabs.tabCloseRequested.connect(self._close_tab)
+        self.script_tabs.tabBarDoubleClicked.connect(self._rename_tab)
+        _slay.addWidget(self.script_tabs)
+        self.editor = QPlainTextEdit()
+        self.editor.setMinimumHeight(170)
+        self.editor.setMaximumHeight(320)
+        _slay.addWidget(self.editor)
+
+        opt_row = QHBoxLayout()
+        self.skip_empty = QCheckBox()
+        self.skip_empty.setChecked(True)
+        self.skip_empty.stateChanged.connect(self.analyze)
+        opt_row.addWidget(self.skip_empty)
+        self.analyze_btn = QPushButton()
+        self.analyze_btn.clicked.connect(self.analyze)
+        opt_row.addWidget(self.analyze_btn)
+        _slay.addLayout(opt_row)
+        lay_type.addWidget(_script_pb)
+
+        lay_type.addWidget(self._hline())
+
+        # --- two-column JP/EN view ---
+        self.lbl_align = QLabel()
+        lay_type.addWidget(self.lbl_align)
+        self.table = QTableWidget(0, 2)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setWordWrap(True)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.itemSelectionChanged.connect(self._on_table_select)
+        self.table.cellDoubleClicked.connect(self._on_table_double)
+        _pb = self._new_panel("jp_en_table", "type")
+        _pb.body_layout().addWidget(self.table)
+        lay_type.addWidget(_pb, 1)
+
+        # --- navigation panel (line nav + bubble stepper + page jump) ---
+        _nav_pb = self._new_panel("nav_line", "type")
+        _navl = _nav_pb.body_layout()
+        nav_row = QHBoxLayout()
+        self.prev_btn = QPushButton()
+        self.prev_btn.clicked.connect(self.on_prev)
+        self.next_btn = QPushButton()
+        self.next_btn.clicked.connect(self.on_next)
+        self.reset_btn = QPushButton()
+        self.reset_btn.clicked.connect(self.on_reset_progress)
+        self.counter = QLabel("0 / 0")
+        self.counter.setAlignment(Qt.AlignCenter)
+        nav_row.addWidget(self.prev_btn)
+        nav_row.addWidget(self.counter, 1)
+        nav_row.addWidget(self.next_btn)
+        nav_row.addWidget(self.reset_btn)
+        _navl.addLayout(nav_row)
+
+        # --- page indicator + jump (only shown when the script has "Page" markers) ---
+        page_row = QHBoxLayout()
+        self.lbl_page = QLabel()
+        self.page_combo = NoScrollComboBox()
+        # 'activated' fires only on user interaction, so syncing the combo to the
+        # current page while navigating does not trigger another jump.
+        self.page_combo.activated.connect(self.on_jump_page)
+        self.page_status = QLabel("")
+        self.page_status.setStyleSheet("color: gray;")
+        page_row.addWidget(self.lbl_page)
+        page_row.addWidget(self.page_combo, 1)
+        page_row.addWidget(self.page_status)
+        _navl.addLayout(page_row)
+        lay_type.addWidget(_nav_pb)
+
+        # --- active text field panel (edit + bold + JP reference) ---
+        _act_pb = self._new_panel("active_field", "type")
+        _actl = _act_pb.body_layout()
+        self.active_edit = QPlainTextEdit()
+        self.active_edit.setMinimumHeight(42)
+        self.active_edit.setMaximumHeight(70)
+        self.active_edit.textChanged.connect(self._update_text_preview)
+        _actl.addWidget(self.active_edit)
+        bold_row = QHBoxLayout()
+        self.bold_sel_btn = QPushButton()
+        self.bold_sel_btn.clicked.connect(self.on_bold_selection)
+        bold_row.addWidget(self.bold_sel_btn)
+        bold_row.addStretch(1)
+        _actl.addLayout(bold_row)
+        self.jp_ref = QLabel("")
+        self.jp_ref.setWordWrap(True)
+        self.jp_ref.setStyleSheet("color: gray;")
+        _actl.addWidget(self.jp_ref)
+        lay_type.addWidget(_act_pb)
+
+        # --- live preview panel ---
+        self.lbl_preview = QLabel("")
+        self.lbl_preview.setStyleSheet("color: gray; margin-top: 2px;")
+        self.preview = TextPreview(self)
+        # Performance build: Lite-mode toggle + manual Refresh button. In Lite
+        # mode the preview stops auto-updating (see _update_text_preview) and is
+        # redrawn only via this button.
+        self.lite_chk = QCheckBox(self._tr("lite_mode"))
+        self.lite_chk.setChecked(self._lite_mode())
+        self.lite_chk.setToolTip(self._tr("lite_hint"))
+        self.lite_chk.toggled.connect(self._on_lite_toggle)
+        self.preview_refresh_btn = QPushButton(self._tr("refresh_preview"))
+        self.preview_refresh_btn.clicked.connect(self._refresh_preview_now)
+        _lite_row = QHBoxLayout()
+        _lite_row.addWidget(self.lite_chk)
+        _lite_row.addStretch(1)
+        _lite_row.addWidget(self.preview_refresh_btn)
+        _pb = self._new_panel("live_preview", "type")
+        _pb.body_layout().addLayout(_lite_row)
+        _pb.body_layout().addWidget(self.lbl_preview)
+        _pb.body_layout().addWidget(self.preview)
+        lay_type.addWidget(_pb)
+        self._sync_preview_controls()
+
+        # --- presets panel (Manga -> Character -> style preset) ---
+        _pb = self._new_panel("presets", "type")
+        _pb.body_layout().addWidget(self.presets_panel)
+        lay_type.addWidget(_pb)
+
+        # --- font picker + text color panel ---
+        _font_pb = self._new_panel("font_picker", "type")
+        _fontl = _font_pb.body_layout()
+        self.lbl_font = QLabel()
+        _fontl.addWidget(self.lbl_font)
+        self.font_picker = FontPicker(self._load_recents(),
+                                      self._tr("font_search_ph"))
+        _fontl.addWidget(self.font_picker)
+        color_row = QHBoxLayout()
+        self.color_btn = QPushButton()
+        self.color_btn.clicked.connect(self.on_pick_color)
+        color_row.addWidget(self.color_btn, 1)
+        _fontl.addLayout(color_row)
+        self._update_color_btn()
+        lay_type.addWidget(_font_pb)
+
+        # --- insert + TextShapR panel ---
+        _ins_pb = self._new_panel("insert", "type")
+        _insl = _ins_pb.body_layout()
+        insert_row = QHBoxLayout()
+        self.insert_btn = QPushButton()
+        self.insert_btn.clicked.connect(self.on_insert)
+        insert_row.addWidget(self.insert_btn, 1)
+        self.shaper_btn = QPushButton()
+        self.shaper_btn.clicked.connect(self.on_open_shaper)
+        insert_row.addWidget(self.shaper_btn)
+        _insl.addLayout(insert_row)
+        lay_type.addWidget(_ins_pb)
+
+        # --- basic style panel: variant + alignment + text processing ---
+        _sb_pb = self._new_panel("style_basic", "style")
+        _sbl = _sb_pb.body_layout()
+        style_row = QHBoxLayout()
+        self.lbl_style = QLabel()
+        style_row.addWidget(self.lbl_style)
+        self.bold_chk = QCheckBox()
+        self.italic_chk = QCheckBox()
+        self.underline_chk = QCheckBox()
+        style_row.addWidget(self.bold_chk)
+        style_row.addWidget(self.italic_chk)
+        style_row.addWidget(self.underline_chk)
+        style_row.addStretch(1)
+        _sbl.addLayout(style_row)
+
+        align_row = QHBoxLayout()
+        self.lbl_alignment = QLabel()
+        align_row.addWidget(self.lbl_alignment)
+        self.align_combo = NoScrollComboBox()
+        for code in ("left", "center", "right"):
+            self.align_combo.addItem("", code)
+        self.align_combo.setCurrentIndex(1)  # center
+        align_row.addWidget(self.align_combo, 1)
+        _sbl.addLayout(align_row)
+
+        valign_row = QHBoxLayout()
+        self.lbl_valign = QLabel()
+        valign_row.addWidget(self.lbl_valign)
+        self.valign_combo = NoScrollComboBox()
+        for code in ("top", "middle", "bottom"):
+            self.valign_combo.addItem("", code)
+        self.valign_combo.setCurrentIndex(1)  # middle
+        valign_row.addWidget(self.valign_combo, 1)
+        _sbl.addLayout(valign_row)
+
+        text_row = QHBoxLayout()
+        self.case_label = QLabel()
+        self.case_combo = NoScrollComboBox()
+        for code in ("none", "upper", "lower"):
+            self.case_combo.addItem("", code)
+        self.case_combo.setCurrentIndex(0)
+        text_row.addWidget(self.case_label)
+        text_row.addWidget(self.case_combo)
+        self.tidy_chk = QCheckBox()
+        text_row.addWidget(self.tidy_chk)
+        text_row.addStretch(1)
+        _sbl.addLayout(text_row)
+        lay_style.addWidget(_sb_pb)
+
+        # --- size / spacing / auto-fit panel ---
+        _ss_pb = self._new_panel("style_size", "style")
+        _ssl = _ss_pb.body_layout()
+        grid = QGridLayout()
+        self.size_label = QLabel()
+        grid.addWidget(self.size_label, 0, 0)
+        self.size_spin = NoScrollSpinBox()
+        self.size_spin.setRange(4, 2000)
+        self.size_spin.setValue(72)
+        grid.addWidget(self.size_spin, 0, 1)
+
+        self.lbl_pad = QLabel()
+        grid.addWidget(self.lbl_pad, 1, 0)
+        self.pad_spin = NoScrollSpinBox()
+        self.pad_spin.setRange(0, 45)
+        self.pad_spin.setValue(12)
+        grid.addWidget(self.pad_spin, 1, 1)
+
+        self.lbl_spacing = QLabel()
+        grid.addWidget(self.lbl_spacing, 2, 0)
+        self.spacing_spin = NoScrollSpinBox()
+        self.spacing_spin.setRange(80, 250)
+        self.spacing_spin.setValue(105)
+        grid.addWidget(self.spacing_spin, 2, 1)
+        _ssl.addLayout(grid)
+
+        self.auto_chk = QCheckBox()
+        self.auto_chk.setChecked(True)
+        self.auto_chk.stateChanged.connect(self._on_auto_toggle)
+        _ssl.addWidget(self.auto_chk)
+
+        self.round_chk = QCheckBox()
+        self.round_chk.stateChanged.connect(self._on_auto_toggle)
+        _ssl.addWidget(self.round_chk)
+        lay_style.addWidget(_ss_pb)
+
+        # --- outline panel: checkbox on the tab, color + width in a popup ---
+        self.outline_dlg = QDialog(main)
+        out_dlg_lay = QVBoxLayout()
+        self.outline_dlg.setLayout(out_dlg_lay)
+        out_opts = QHBoxLayout()
+        self.outline_color_btn = QPushButton()
+        self.outline_color_btn.clicked.connect(self.on_pick_outline_color)
+        out_opts.addWidget(self.outline_color_btn)
+        self.lbl_outline_width = QLabel()
+        out_opts.addWidget(self.lbl_outline_width)
+        self.outline_spin = NoScrollSpinBox()
+        self.outline_spin.setRange(1, 200)
+        self.outline_spin.setValue(4)
+        out_opts.addWidget(self.outline_spin)
+        out_dlg_lay.addLayout(out_opts)
+        self.outline_close_btn = QPushButton()
+        self.outline_close_btn.clicked.connect(self.outline_dlg.accept)
+        out_dlg_lay.addWidget(self.outline_close_btn)
+
+        _out_pb = self._new_panel("style_outline", "style")
+        out_row = QHBoxLayout()
+        self.outline_chk = QCheckBox()
+        self.outline_chk.stateChanged.connect(self._on_outline_toggle)
+        out_row.addWidget(self.outline_chk)
+        self.outline_more_btn = QPushButton()
+        self.outline_more_btn.clicked.connect(self.outline_dlg.show)
+        out_row.addWidget(self.outline_more_btn)
+        out_row.addStretch(1)
+        _out_pb.body_layout().addLayout(out_row)
+        lay_style.addWidget(_out_pb)
+        self._update_outline_btn()
+
+        # --- shadow panel: checkbox on the tab, color + offset in a popup ---
+        self.shadow_dlg = QDialog(main)
+        sh_dlg_lay = QVBoxLayout()
+        self.shadow_dlg.setLayout(sh_dlg_lay)
+        sh_opts = QHBoxLayout()
+        self.shadow_color_btn = QPushButton()
+        self.shadow_color_btn.clicked.connect(self.on_pick_shadow_color)
+        sh_opts.addWidget(self.shadow_color_btn)
+        self.lbl_shadow_off = QLabel()
+        sh_opts.addWidget(self.lbl_shadow_off)
+        self.shadow_x_spin = NoScrollSpinBox()
+        self.shadow_x_spin.setRange(-100, 100)
+        self.shadow_x_spin.setValue(3)
+        self.shadow_y_spin = NoScrollSpinBox()
+        self.shadow_y_spin.setRange(-100, 100)
+        self.shadow_y_spin.setValue(3)
+        sh_opts.addWidget(self.shadow_x_spin)
+        sh_opts.addWidget(self.shadow_y_spin)
+        sh_dlg_lay.addLayout(sh_opts)
+        self.shadow_close_btn = QPushButton()
+        self.shadow_close_btn.clicked.connect(self.shadow_dlg.accept)
+        sh_dlg_lay.addWidget(self.shadow_close_btn)
+
+        _sh_pb = self._new_panel("style_shadow", "style")
+        sh_row = QHBoxLayout()
+        self.shadow_chk = QCheckBox()
+        self.shadow_chk.stateChanged.connect(self._on_shadow_toggle)
+        sh_row.addWidget(self.shadow_chk)
+        self.shadow_more_btn = QPushButton()
+        self.shadow_more_btn.clicked.connect(self.shadow_dlg.show)
+        sh_row.addWidget(self.shadow_more_btn)
+        sh_row.addStretch(1)
+        _sh_pb.body_layout().addLayout(sh_row)
+        lay_style.addWidget(_sh_pb)
+        self._update_shadow_btn()
+
+        # --- hyphenation panel (split long words at syllable points) ---
+        _hy_pb = self._new_panel("hyphenation", "style")
+        _hyl = _hy_pb.body_layout()
+        self.hyph_chk = QCheckBox()
+        self.hyph_chk.stateChanged.connect(self._on_hyph_toggle)
+        _hyl.addWidget(self.hyph_chk)
+        hyph_row = QHBoxLayout()
+        self.lbl_hyph_lang = QLabel()
+        hyph_row.addWidget(self.lbl_hyph_lang)
+        self.hyph_lang_combo = NoScrollComboBox()
+        # only offer languages whose hyphenation patterns are bundled
+        for code in ("auto",) + L.HYPH_LANGS:
+            self.hyph_lang_combo.addItem("", code)
+        self.hyph_lang_combo.currentIndexChanged.connect(
+            lambda *_a: self._update_text_preview())
+        hyph_row.addWidget(self.hyph_lang_combo, 1)
+        _hyl.addLayout(hyph_row)
+        lay_style.addWidget(_hy_pb)
+        lay_style.addStretch(1)
+
+        # status line below the tabs, always visible
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        outer.addWidget(self.status)
+
+        self.setWidget(main)
+
+        # --- tab customization (rename / reorder / reset) ---
+        # Each tab carries a stable id in its tabData, so text and order stay
+        # correct even after the user drags tabs around. Custom names and the
+        # order are persisted; the panel-level drag/detach comes in a later
+        # phase and builds on layoutmodel.py.
+        self._tab_defaults = [("type", "tab_type"), ("style", "tab_style"),
+                              ("setup", "tab_setup")]
+        self._tab_pages = {}          # id -> tab page widget (kept when hidden)
+        for i, (tid, _nk) in enumerate(self._tab_defaults):
+            self.main_tabs.tabBar().setTabData(i, tid)
+            self._tab_pages[tid] = self.main_tabs.widget(i)
+        self._tab_names = self._load_tab_names()      # id -> custom name
+        # apply the TextShapR-button enable state now that the toggles exist
+        self._on_enable_shapr(self.enable_shapr_chk.isChecked(), save=False)
+        self._apply_tab_order(self._load_tab_order())
+        self._retranslate_tabs()
+        self.main_tabs.tabBar().setMovable(self.customize_chk.isChecked())
+        self.main_tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+        self.main_tabs.tabBarDoubleClicked.connect(self._on_tab_rename)
+        # restore saved panel placements (tab) + within-tab order + header
+        self._apply_panel_positions()
+        self._apply_panel_order()
+        # re-detach panels into their host windows once those dockers exist
+        # (deferred: the host dockers are constructed by Krita separately)
+        QTimer.singleShot(0, self._apply_detached)
+
+        # remember the last-used main tab across restarts
+        self.main_tabs.setCurrentIndex(self._load_ui_tab())
+        self.main_tabs.currentChanged.connect(self._save_ui_tab)
+
+        self._apply_settings(self._load_settings())
+        self._on_outline_toggle()
+        self._on_shadow_toggle()
+        self._on_auto_toggle()
+        self._refresh_groups_combo()
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._refresh_pages_combo()
+        self._wire_preview()
+        self._retranslate()
+        self._refresh_view()
+        self._apply_view()
+        self._apply_preset_mode()          # show/hide the character level
+        self._update_text_preview()
+        self._init_first_session()         # start with one empty "Untitled" tab
+
+    # -- language --
+
+    def _tr(self, key):
+        table = LANG.get(self._lang, LANG["en"])
+        return table.get(key, LANG["en"].get(key, key))
+
+    def _load_lang(self):
+        try:
+            v = Krita.instance().readSetting("typer_perf", "uiLang", "")
+            return v if v in LANG else "en"
+        except Exception:
+            return "en"
+
+    def _save_lang(self):
+        try:
+            Krita.instance().writeSetting("typer_perf", "uiLang", self._lang)
+        except Exception:
+            pass
+
+    def _load_auto_char(self):
+        try:
+            return Krita.instance().readSetting(
+                "typer_perf", "autoChar", "true") != "false"
+        except Exception:
+            return True
+
+    def _on_auto_char_toggle(self, checked):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "autoChar", "true" if checked else "false")
+        except Exception:
+            pass
+        if checked:
+            self._show_current()      # auf die aktuelle Zeile sofort anwenden
+
+    def _load_auto_manga(self):
+        try:
+            return Krita.instance().readSetting(
+                "typer_perf", "autoManga", "true") != "false"
+        except Exception:
+            return True
+
+    def _load_replace_existing(self):
+        try:
+            return Krita.instance().readSetting(
+                "typer_perf", "replaceExisting", "true") != "false"
+        except Exception:
+            return True
+
+    def _on_replace_toggle(self, checked):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "replaceExisting", "true" if checked else "false")
+        except Exception:
+            pass
+
+    # ---- preset mode: with a character level, or one flat list per manga ----
+
+    def _load_by_char(self):
+        try:
+            return Krita.instance().readSetting(
+                "typer_perf", "presetsByCharacter", "true") != "false"
+        except Exception:
+            return True
+
+    def _by_char(self):
+        """True = Manga -> Character -> preset (default); False = simple mode
+        (Manga -> preset, character level hidden)."""
+        chk = getattr(self, "by_char_chk", None)
+        return True if chk is None else chk.isChecked()
+
+    def _on_by_char_toggle(self, checked):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "presetsByCharacter", "true" if checked else "false")
+        except Exception:
+            pass
+        self._apply_preset_mode()
+
+    def _apply_preset_mode(self):
+        """Show/hide the character level and rebuild the preset dropdown for
+        the active mode. Simple mode is only a view – the stored 3-level
+        preset data is never migrated or renamed."""
+        by_char = self._by_char()
+        for w in (self.lbl_char, self.char_combo, self.char_new_btn,
+                  self.char_del_btn):
+            w.setVisible(by_char)
+        self.auto_char_chk.setVisible(by_char)
+        self._refresh_presets_combo()
+
+    def _preset_ref(self, data):
+        """(owning character, preset name) for a preset-combo item's data.
+        Character mode stores just the name (owner = current character);
+        simple mode stores the (character, name) tuple. ('', '') for none."""
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return str(data[0]), str(data[1])
+        if data:
+            return self._char, str(data)
+        return "", ""
+
+    def _bucket_char(self):
+        """Character that receives newly saved presets in simple mode: the
+        localized default character if the manga has one, else its first
+        character (created on demand by _ensure_levels)."""
+        self._ensure_levels()
+        chars = self._groups[self._group]
+        cd = self._tr("char_default")
+        if cd in chars:
+            return cd
+        return sorted(chars.keys(), key=lambda s: s.lower())[0]
+
+    def _on_auto_manga_toggle(self, checked):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "autoManga", "true" if checked else "false")
+        except Exception:
+            pass
+
+    def _maybe_auto_manga(self, text, filename=""):
+        """If 'auto manga' is on, detect which saved manga this script belongs
+        to (file name / header / first lines) and switch to it. Does nothing
+        when the feature is off or no manga matches."""
+        chk = getattr(self, "auto_manga_chk", None)
+        if chk is None or not chk.isChecked():
+            return
+        match = LP.detect_manga(list(self._groups.keys()), text, filename)
+        if not match or match == self._group:
+            return
+        self._group = match
+        self._char = ""
+        self._refresh_groups_combo(select=match)
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._apply_default_preset()      # default style for the new character
+        self._set_status(self._tr("st_auto_manga").format(name=match))
+
+    def _maybe_auto_character(self, text):
+        """If 'auto character' is on and the line starts with a speaker name
+        ('Name: …') that matches a character in the current manga, switch to
+        that character (and apply its default style preset). Returns the text
+        without the speaker prefix so the bubble stays clean; otherwise the
+        text unchanged."""
+        if not self._by_char():
+            return text        # simple mode: characters are not in the workflow
+        chk = getattr(self, "auto_char_chk", None)
+        if chk is None or not chk.isChecked():
+            return text
+        name, rest = LP.split_speaker(text)
+        if not name:
+            return text
+        match = None
+        for ch in self._cur_chars():
+            if ch.lower() == name.lower():
+                match = ch
+                break
+        if not match:
+            return text
+        if match != self._char:
+            self._char = match
+            self._refresh_chars_combo(select=match)
+            self._apply_default_preset()
+            self._set_status(self._tr("st_auto_char").format(name=match))
+        return rest
+
+    # ---- preset usage learning (per manga/character) ----
+    def _load_preset_usage(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "presetUsage", "")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_preset_usage(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "presetUsage", json.dumps(self._preset_usage))
+        except Exception:
+            pass
+
+    def _record_preset_usage(self, manga, char, preset):
+        """Count that `preset` was used for (manga, char) so the default-preset
+        picker can learn the most-used style over time."""
+        if not (manga and char and preset):
+            return
+        by_manga = self._preset_usage.setdefault(manga, {})
+        by_char = by_manga.setdefault(char, {})
+        by_char[preset] = int(by_char.get(preset, 0)) + 1
+        self._save_preset_usage()
+
+    def _apply_default_preset(self):
+        """Auto-select the current character's default preset (normal/talking,
+        else most-used, else first non-none). Does nothing if the character has
+        no real preset. In simple mode the default is picked from ALL presets
+        of the manga (usage counts merged across characters)."""
+        if not self._by_char():
+            entries = LP.flatten_presets(self._cur_chars())
+            usage_by_char = self._preset_usage.get(self._group, {})
+            usage = {}
+            for _label, ch, name in entries:
+                n = int(usage_by_char.get(ch, {}).get(name, 0))
+                if n:
+                    usage[name] = usage.get(name, 0) + n
+            name = LP.default_preset_for([e[2] for e in entries], usage)
+            for _label, ch, nm in entries:
+                if name and nm == name:
+                    self._apply_preset(self._cur_chars()[ch][nm])
+                    self._refresh_presets_combo(select=(ch, nm))
+                    return
+            self._refresh_presets_combo()
+            return
+        presets = self._cur_presets()
+        usage = self._preset_usage.get(self._group, {}).get(self._char, {})
+        name = LP.default_preset_for(list(presets.keys()), usage)
+        if name and name in presets:
+            self._apply_preset(presets[name])
+            self._refresh_presets_combo(select=name)
+        else:
+            self._refresh_presets_combo()
+
+    def _on_lang_change(self):
+        self._lang = self.lang_combo.currentData() or "en"
+        self._save_lang()
+        self._retranslate()
+        self._refresh_view()
+
+    def _retranslate(self):
+        t = self._tr
+        self.setWindowTitle(t("title"))
+        self._retranslate_tabs()
+        self.lang_label.setText(t("language"))
+        self.view_toggle.setText(t("view_toggle"))
+        self.view_hint.setText(t("view_hint"))
+        self.v_preview_chk.setText(t("view_preview"))
+        self.v_editor_chk.setText(t("view_editor"))
+        self.v_table_chk.setText(t("view_table"))
+        self.v_fonts_chk.setText(t("view_fonts"))
+        self.view_reset_btn.setText(t("view_reset"))
+        self.load_btn.setText(t("load_btn"))
+        self.lbl_script.setText(t("script_label"))
+        self.editor.setPlaceholderText(t("editor_ph"))
+        self.skip_empty.setText(t("skip_empty"))
+        self.analyze_btn.setText(t("analyze_btn"))
+        self.lbl_align.setText(t("align_label"))
+        self.table.setHorizontalHeaderLabels([t("col_source"), t("col_translation")])
+        self.prev_btn.setText(t("prev"))
+        self.next_btn.setText(t("next"))
+        self.reset_btn.setText(t("reset_btn"))
+        self.lbl_page.setText(t("page_jump"))
+        self.active_edit.setPlaceholderText(t("active_ph"))
+        self.lbl_preview.setText(t("preview_label"))
+        self._update_text_preview()
+        self.lbl_font.setText(t("font"))
+        self.font_picker.set_search_placeholder(t("font_search_ph"))
+        self.lbl_style.setText(t("style"))
+        self.bold_chk.setText(t("bold"))
+        self.italic_chk.setText(t("italic"))
+        self.underline_chk.setText(t("underline"))
+        self.lbl_alignment.setText(t("align"))
+        self.align_combo.setItemText(0, t("align_left"))
+        self.align_combo.setItemText(1, t("align_center"))
+        self.align_combo.setItemText(2, t("align_right"))
+        self.lbl_valign.setText(t("valign_label"))
+        self.valign_combo.setItemText(0, t("valign_top"))
+        self.valign_combo.setItemText(1, t("valign_middle"))
+        self.valign_combo.setItemText(2, t("valign_bottom"))
+        self.case_label.setText(t("case_label"))
+        self.case_combo.setItemText(0, t("case_none"))
+        self.case_combo.setItemText(1, t("case_upper"))
+        self.case_combo.setItemText(2, t("case_lower"))
+        self.bold_sel_btn.setText(t("bold_sel"))
+        self.bold_sel_btn.setToolTip(t("bold_sel_tip"))
+        self.tidy_chk.setText(t("tidy"))
+        self.tidy_chk.setToolTip(t("tidy_tip"))
+        self.round_chk.setText(t("round"))
+        self.round_chk.setToolTip(t("round_tip"))
+        self.shadow_chk.setText(t("shadow"))
+        self.shadow_chk.setToolTip(t("shadow_tip"))
+        self.shadow_color_btn.setText(t("shadow_color_btn"))
+        self.lbl_shadow_off.setText(t("shadow_off"))
+        self.lbl_preset.setText(t("style_label"))
+        self.lbl_group.setText(t("group"))
+        self.group_new_btn.setText(t("group_new"))
+        self.group_del_btn.setText(t("group_del"))
+        self.lbl_char.setText(t("char"))
+        self.char_new_btn.setText(t("char_new"))
+        self.char_del_btn.setText(t("char_del"))
+        self.auto_char_chk.setText(t("auto_char"))
+        self.auto_char_chk.setToolTip(t("auto_char_tip"))
+        self.auto_manga_chk.setText(t("auto_manga"))
+        self.auto_manga_chk.setToolTip(t("auto_manga_tip"))
+        self.preset_menu_btn.setToolTip(t("preset_actions"))
+        self.preset_save_act.setText(t("preset_save"))
+        self.preset_del_act.setText(t("preset_del"))
+        self.preset_import_act.setText(t("preset_import"))
+        self.preset_export_act.setText(t("preset_export"))
+        # relabel the first combo entry (no preset)
+        if self.preset_combo.count() > 0:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setItemText(0, t("preset_none"))
+            self.preset_combo.blockSignals(False)
+        self.size_label.setText(
+            t("size_max") if self.auto_chk.isChecked() else t("size_fixed"))
+        self.size_spin.setToolTip(t("size_tip"))
+        self.color_btn.setText(t("color_btn"))
+        self.lbl_pad.setText(t("padding"))
+        self.pad_spin.setToolTip(t("padding_tip"))
+        self.lbl_spacing.setText(t("spacing"))
+        self.outline_chk.setText(t("outline"))
+        self.outline_chk.setToolTip(t("outline_tip"))
+        self.outline_color_btn.setText(t("outline_color_btn"))
+        self.lbl_outline_width.setText(t("outline_width"))
+        self.outline_more_btn.setText(t("outline_more"))
+        self.outline_dlg.setWindowTitle(t("outline"))
+        self.outline_close_btn.setText(t("close"))
+        self.shadow_more_btn.setText(t("shadow_more"))
+        self.shadow_dlg.setWindowTitle(t("shadow"))
+        self.shadow_close_btn.setText(t("close"))
+        self.auto_chk.setText(t("auto"))
+        self.auto_chk.setToolTip(t("auto_tip"))
+        self.hyph_chk.setText(t("hyphenate"))
+        self.hyph_chk.setToolTip(t("hyphenate_tip"))
+        self.lbl_hyph_lang.setText(t("hyph_lang"))
+        for i in range(self.hyph_lang_combo.count()):
+            code = self.hyph_lang_combo.itemData(i)
+            self.hyph_lang_combo.setItemText(
+                i, t("hyph_auto" if code == "auto" else "hyph_" + str(code)))
+        self.insert_btn.setText(t("insert_btn"))
+        self.shaper_btn.setText(t("shaper_btn"))
+        self.shaper_btn.setToolTip(t("shaper_btn_tip"))
+        self.replace_chk.setText(t("replace_existing"))
+        self.replace_chk.setToolTip(t("replace_existing_tip"))
+        self.by_char_chk.setText(t("presets_by_char"))
+        self.by_char_chk.setToolTip(t("presets_by_char_tip"))
+        self._retranslate_panels()
+        self.exp_toggle.setText("⚗ " + t("exp_section"))
+        self.enable_shapr_chk.setText(t("enable_shapr"))
+        self.customize_chk.setText(t("customize_layout"))
+        self.customize_hint.setText(t("customize_hint"))
+        self.layout_reset_btn.setText(t("layout_reset"))
+        # re-label the page combo / status in the new language
+        self._refresh_pages_combo()
+
+    # -- UI helpers --
+
+    def _hline(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        return line
+
+    def _update_color_btn(self):
+        self.color_btn.setStyleSheet(
+            "QPushButton {{ background-color: {}; }}".format(self._color.name())
+        )
+        self._update_text_preview()
+
+    def _update_outline_btn(self):
+        self.outline_color_btn.setStyleSheet(
+            "QPushButton {{ background-color: {}; }}".format(
+                self._outline_color.name())
+        )
+        self._update_text_preview()
+
+    def _on_outline_toggle(self):
+        on = self.outline_chk.isChecked()
+        self.outline_color_btn.setEnabled(on)
+        self.outline_spin.setEnabled(on)
+        if hasattr(self, "outline_more_btn"):
+            self.outline_more_btn.setEnabled(on)
+
+    def _update_shadow_btn(self):
+        self.shadow_color_btn.setStyleSheet(
+            "QPushButton {{ background-color: {}; }}".format(
+                self._shadow_color.name())
+        )
+        self._update_text_preview()
+
+    def _on_shadow_toggle(self):
+        on = self.shadow_chk.isChecked()
+        self.shadow_color_btn.setEnabled(on)
+        self.shadow_x_spin.setEnabled(on)
+        self.shadow_y_spin.setEnabled(on)
+        if hasattr(self, "shadow_more_btn"):
+            self.shadow_more_btn.setEnabled(on)
+
+    def on_pick_shadow_color(self):
+        col = QColorDialog.getColor(self._shadow_color, self.widget(),
+                                    self._tr("shadow_color_btn"))
+        if col.isValid():
+            self._shadow_color = col
+            self._update_shadow_btn()
+
+    def _set_status(self, msg, error=False):
+        self.status.setStyleSheet("color: #c0392b;" if error else "color: gray;")
+        self.status.setText(msg)
+
+    # -- main tabs (remember the last-used one) --
+
+    # -- tab customization (rename / reorder / reset) ----------------------
+
+    def _tab_namekey(self, tid):
+        for t, nk in self._tab_defaults:
+            if t == tid:
+                return nk
+        return None
+
+    def _tab_label(self, tid):
+        """Display name of a tab: the user's custom name if set, else the
+        localized default."""
+        custom = self._tab_names.get(tid)
+        if custom:
+            return custom
+        nk = self._tab_namekey(tid)
+        return self._tr(nk) if nk else (tid or "")
+
+    def _retranslate_tabs(self):
+        bar = self.main_tabs.tabBar()
+        for i in range(self.main_tabs.count()):
+            self.main_tabs.setTabText(i, self._tab_label(bar.tabData(i)))
+
+    def _current_tab_order(self):
+        bar = self.main_tabs.tabBar()
+        return [bar.tabData(i) for i in range(self.main_tabs.count())]
+
+    def _apply_tab_order(self, order):
+        """Reorder the tab bar so its tab ids follow `order` (unknown/missing
+        ids are ignored / left in place). Done by moving tabs into position."""
+        if not order:
+            return
+        bar = self.main_tabs.tabBar()
+        bar.blockSignals(True)
+        try:
+            for target, tid in enumerate(order):
+                cur = next((i for i in range(self.main_tabs.count())
+                            if bar.tabData(i) == tid), None)
+                if cur is not None and cur != target:
+                    bar.moveTab(cur, target)
+        except Exception:
+            pass
+        finally:
+            bar.blockSignals(False)
+
+    def _on_tab_moved(self, *_a):
+        Krita.instance().writeSetting(
+            "typer_perf", "tabOrder", ",".join(self._current_tab_order()))
+
+    def _on_tab_rename(self, index):
+        if not self.customize_chk.isChecked():
+            return
+        if not (0 <= index < self.main_tabs.count()):
+            return
+        tid = self.main_tabs.tabBar().tabData(index)
+        cur = self._tab_label(tid)
+        name, ok = QInputDialog.getText(
+            self.widget(), self._tr("tab_rename_title"),
+            self._tr("tab_rename_prompt"), text=cur)
+        if not ok:
+            return
+        name = name.strip()
+        if name and name != self._tr(self._tab_namekey(tid) or ""):
+            self._tab_names[tid] = name
+        else:
+            self._tab_names.pop(tid, None)      # empty / default -> reset name
+        self._save_tab_names()
+        self._retranslate_tabs()
+
+    def _on_customize_toggle(self, on):
+        self.main_tabs.tabBar().setMovable(bool(on))
+        if hasattr(self, "customize_hint"):
+            self.customize_hint.setVisible(bool(on))
+        for pid, box in getattr(self, "_panels", {}).items():
+            box.set_edit(on or pid in self._detached)
+        Krita.instance().writeSetting(
+            "typer_perf", "customize", "true" if on else "false")
+
+    def _on_exp_toggle(self, on):
+        if hasattr(self, "exp_box"):
+            self.exp_box.setVisible(bool(on))
+        Krita.instance().writeSetting(
+            "typer_perf", "expOpen", "true" if on else "false")
+
+    # -- movable panels (customizable layout, step 2a) ---------------------
+
+    _PANEL_TITLES = {"presets": "panel_presets",
+                     "jp_en_table": "panel_table",
+                     "live_preview": "panel_preview",
+                     "script_box": "panel_script",
+                     "nav_line": "panel_nav",
+                     "active_field": "panel_active",
+                     "font_picker": "panel_font",
+                     "insert": "panel_insert",
+                     "style_basic": "panel_style_basic",
+                     "style_size": "panel_style_size",
+                     "style_outline": "panel_style_outline",
+                     "style_shadow": "panel_style_shadow",
+                     "hyphenation": "panel_hyphenation",
+                     "setup_general": "panel_setup_general",
+                     "layout_sizes": "panel_layout_sizes"}
+
+    def _new_panel(self, pid, tab_id):
+        """Create a PanelBox for panel `pid`, initially living in `tab_id`.
+        Called during UI build; the caller adds the box to that tab's
+        layout."""
+        box = PanelBox(pid, self)
+        self._panels[pid] = box
+        self._panel_tab[pid] = tab_id
+        self._panel_home[pid] = tab_id     # default tab, used by layout reset
+        return box
+
+    def _panel_title(self, pid):
+        return self._tr(self._PANEL_TITLES.get(pid, pid))
+
+    def _retranslate_panels(self):
+        for pid, box in self._panels.items():
+            box.set_title(self._panel_title(pid))
+
+    def _fill_panel_menu(self, menu, pid):
+        """Populate a panel's ⋮ menu: reorder within the tab (up/down), move
+        to another tab, and detach into / reattach from a separate window."""
+        if pid in self._detached:
+            act = menu.addAction("⧉  " + self._tr("panel_reattach"))
+            act.triggered.connect(
+                lambda _c=False, p=pid: self._reattach_panel(p))
+            return
+        up = menu.addAction("▲  " + self._tr("panel_up"))
+        up.triggered.connect(lambda _c=False, p=pid: self._reorder_panel(p, -1))
+        down = menu.addAction("▼  " + self._tr("panel_down"))
+        down.triggered.connect(
+            lambda _c=False, p=pid: self._reorder_panel(p, 1))
+        menu.addSeparator()
+        cur = self._panel_tab.get(pid)
+        for i in range(self.main_tabs.count()):
+            tid = self.main_tabs.tabBar().tabData(i)
+            if tid == cur or tid not in self._tab_layouts:
+                continue
+            act = menu.addAction(self._tr("panel_move_to").format(
+                tab=self.main_tabs.tabText(i)))
+            act.triggered.connect(
+                lambda _c=False, t=tid, p=pid: self._move_panel_to_tab(p, t))
+        menu.addSeparator()
+        det = menu.addAction("⧉  " + self._tr("panel_detach"))
+        det.triggered.connect(lambda _c=False, p=pid: self._detach_panel(p))
+
+    def _panel_layout_index(self, lay, box):
+        for i in range(lay.count()):
+            if lay.itemAt(i).widget() is box:
+                return i
+        return None
+
+    def _reorder_panel(self, pid, delta):
+        """Move the panel up/down by one position within its current tab.
+        Swaps past whatever widget is adjacent (panel or inline section)."""
+        box = self._panels.get(pid)
+        lay = self._tab_layouts.get(self._panel_tab.get(pid))
+        if box is None or lay is None:
+            return
+        idx = self._panel_layout_index(lay, box)
+        if idx is None:
+            return
+        lay.removeWidget(box)
+        target = idx + delta
+        # after removal the max insert index is lay.count(); clamp, but skip a
+        # trailing stretch so the panel never ends up below it
+        maxpos = lay.count()
+        if maxpos > 0 and lay.itemAt(maxpos - 1).spacerItem() is not None:
+            maxpos -= 1
+        target = max(0, min(target, maxpos))
+        lay.insertWidget(target, box)
+        box.show()
+        self._save_panel_order()
+
+    def _save_panel_order(self):
+        """Persist the per-tab panel order (list of panel ids per tab), so
+        reordering survives a restart."""
+        order = {}
+        for tid, lay in self._tab_layouts.items():
+            ids = []
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if isinstance(w, PanelBox):
+                    ids.append(w._pid)
+            order[tid] = ids
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "panelOrder", json.dumps(order))
+        except Exception:
+            pass
+
+    def _panels_in_tab(self, lay):
+        """List of (pid, layout_index) for the PanelBoxes in a tab layout,
+        in layout order."""
+        out = []
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, PanelBox):
+                out.append((w._pid, i))
+        return out
+
+    def _apply_panel_order(self):
+        """Restore the saved within-tab panel order. Panels are reordered
+        RELATIVE to each other only; inline (non-panel) sections keep their
+        place. Best effort — a bubble pass swaps out-of-order neighbours."""
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "panelOrder", "")
+            order = json.loads(raw) if raw else {}
+        except Exception:
+            return
+        for tid, ids in order.items():
+            lay = self._tab_layouts.get(tid)
+            if lay is None:
+                continue
+            present = [pid for pid, _i in self._panels_in_tab(lay)]
+            desired = [p for p in ids if p in present]
+            desired += [p for p in present if p not in desired]
+            for _ in range(len(desired) * len(desired) + 1):
+                pos = dict(self._panels_in_tab(lay))
+                swapped = False
+                for a, b in zip(desired, desired[1:]):
+                    if pos.get(a, -1) > pos.get(b, 1 << 30):
+                        box = self._panels[a]
+                        lay.removeWidget(box)
+                        bi = self._panel_layout_index(
+                            lay, self._panels[b])
+                        lay.insertWidget(bi if bi is not None
+                                         else lay.count(), box)
+                        box.show()
+                        swapped = True
+                        break
+                if not swapped:
+                    break
+
+    def _move_panel_to_tab(self, pid, tab_id, save=True):
+        box = self._panels.get(pid)
+        if box is None or tab_id not in self._tab_layouts:
+            return
+        src = self._panel_tab.get(pid)
+        if src in self._tab_layouts:
+            self._tab_layouts[src].removeWidget(box)
+        lay = self._tab_layouts[tab_id]
+        # insert before a trailing stretch so the panel stays visible
+        pos = lay.count()
+        if pos > 0 and lay.itemAt(pos - 1).spacerItem() is not None:
+            pos -= 1
+        lay.insertWidget(pos, box)
+        box.show()
+        self._panel_tab[pid] = tab_id
+        if save:
+            self._save_panel_tabs()
+            self._save_panel_order()
+
+    def _drop_panel_rel(self, dragged, target, after):
+        """Drop `dragged` next to `target` (before it, or after it when
+        `after`). Handles both within-tab reordering and moving into the
+        target's tab. Called by PanelBox.dropEvent."""
+        if dragged == target:
+            return
+        box = self._panels.get(dragged)
+        tgt = self._panels.get(target)
+        if box is None or tgt is None:
+            return
+        tab_id = self._panel_tab.get(target)
+        lay = self._tab_layouts.get(tab_id)
+        if lay is None:
+            return
+        src = self._panel_tab.get(dragged)
+        if src in self._tab_layouts:
+            self._tab_layouts[src].removeWidget(box)
+        # recompute the target index after a possible same-tab removal
+        ti = self._panel_layout_index(lay, tgt)
+        if ti is None:
+            pos = lay.count()
+            if pos > 0 and lay.itemAt(pos - 1).spacerItem() is not None:
+                pos -= 1
+            lay.insertWidget(pos, box)
+        else:
+            lay.insertWidget(ti + (1 if after else 0), box)
+        box.show()
+        self._panel_tab[dragged] = tab_id
+        self._save_panel_tabs()
+        self._save_panel_order()
+
+    def _panel_drag_started(self):
+        self._panel_dragging = True
+        if getattr(self, "_drag_scroll_timer", None) is None:
+            self._drag_scroll_timer = QTimer(self)
+            self._drag_scroll_timer.setInterval(30)
+            self._drag_scroll_timer.timeout.connect(self._drag_scroll_tick)
+        self._drag_scroll_timer.start()
+
+    def _panel_drag_finished(self):
+        self._panel_dragging = False
+        if getattr(self, "_drag_scroll_timer", None) is not None:
+            self._drag_scroll_timer.stop()
+
+    def _drag_scroll_tick(self):
+        """While a panel is being dragged, auto-scroll the current tab's
+        scroll area when the cursor nears its top/bottom edge, so a panel can
+        be dropped past the visible region."""
+        sa = self.main_tabs.currentWidget()
+        if not isinstance(sa, QScrollArea):
+            return
+        vp = sa.viewport()
+        pos = vp.mapFromGlobal(QCursor.pos())
+        if not (0 <= pos.x() <= vp.width()):
+            return                       # cursor is outside this list
+        margin, step = 34, 26
+        bar = sa.verticalScrollBar()
+        if pos.y() < margin:
+            bar.setValue(bar.value() - step)
+        elif pos.y() > vp.height() - margin:
+            bar.setValue(bar.value() + step)
+
+    def _ensure_tabbar_dnd(self):
+        """One-time: let the top tab bar accept panel drops (drop a panel on
+        a tab to move it into that tab)."""
+        if getattr(self, "_tabbar_dnd_ready", False):
+            return
+        bar = self.main_tabs.tabBar()
+        bar.setAcceptDrops(True)
+        bar.installEventFilter(self)
+        self._tabbar_dnd_ready = True
+
+    def eventFilter(self, obj, ev):
+        """Handle panel drops onto the top tab bar (cross-tab move)."""
+        bar = self.main_tabs.tabBar()
+        if obj is bar:
+            et = ev.type()
+            if et in (QEvent.DragEnter, QEvent.DragMove):
+                if ev.mimeData().hasFormat(PANEL_MIME):
+                    i = bar.tabAt(ev.pos())
+                    if i >= 0:
+                        # preview the destination tab so a following body drop
+                        # lands where the user expects
+                        self.main_tabs.setCurrentIndex(i)
+                    ev.acceptProposedAction()
+                    return True
+                ev.ignore()
+                return True
+            if et == QEvent.Drop:
+                if ev.mimeData().hasFormat(PANEL_MIME):
+                    pid = bytes(ev.mimeData().data(PANEL_MIME)).decode("utf-8")
+                    i = bar.tabAt(ev.pos())
+                    tid = bar.tabData(i) if i >= 0 else None
+                    if tid in self._tab_layouts:
+                        self._move_panel_to_tab(pid, tid)
+                    ev.acceptProposedAction()
+                    return True
+                ev.ignore()
+                return True
+        return super(TyperDocker, self).eventFilter(obj, ev)
+
+    def _set_panel_locked(self, pid, on):
+        """Pin/unpin a panel (called by its padlock button) and persist it."""
+        box = self._panels.get(pid)
+        if box is None:
+            return
+        box.set_locked(on)
+        self._save_panel_locked()
+
+    def _save_panel_locked(self):
+        locked = [pid for pid, box in self._panels.items()
+                  if getattr(box, "_locked", False)]
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "panelLocked", json.dumps(locked))
+        except Exception:
+            pass
+
+    def _load_panel_locked(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "panelLocked", "")
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def _save_panel_heights(self):
+        heights = {pid: box._user_height
+                   for pid, box in self._panels.items()
+                   if getattr(box, "_user_height", 0) > 0}
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "panelHeights", json.dumps(heights))
+        except Exception:
+            pass
+
+    def _load_panel_heights(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "panelHeights", "")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    # -- detach into a separate window (customizable layout, step 2c) -------
+
+    def _free_detach_slot(self):
+        """Lowest host-docker slot that exists and holds no panel yet."""
+        used = {s for s in self._detached.values() if isinstance(s, int)}
+        for s in range(MAX_DETACH_SLOTS):
+            if s in _EXTRA_HOSTS and s not in used:
+                return s
+        return None
+
+    def _detach_panel(self, pid, prefer=None):
+        """Move a panel out of its tab into its own window: a pre-registered
+        host docker when one is free, otherwise a floating tool dialog."""
+        box = self._panels.get(pid)
+        if box is None or pid in self._detached:
+            return
+        src = self._panel_tab.get(pid)
+        if src in self._tab_layouts:
+            self._tab_layouts[src].removeWidget(box)
+        slot = prefer if (isinstance(prefer, int)
+                          and prefer in _EXTRA_HOSTS
+                          and prefer not in
+                          {s for s in self._detached.values()
+                           if isinstance(s, int)}) else None
+        if slot is None and prefer != "float":
+            slot = self._free_detach_slot()
+        if slot is not None:
+            host = _EXTRA_HOSTS[slot]
+            host.show_placeholder(False)
+            host.host_layout().insertWidget(0, box)
+            host.setVisible(True)
+            host.raise_()
+            self._detached[pid] = slot
+        else:
+            dlg = QDialog(self, Qt.Tool)
+            dlg.setWindowTitle(self._panel_title(pid))
+            dl = QVBoxLayout(dlg)
+            dl.setContentsMargins(4, 4, 4, 4)
+            dl.addWidget(box)
+            dlg.resize(320, 420)
+            dlg.finished.connect(
+                lambda _r=0, p=pid: self._reattach_panel(p))
+            self._float_dialogs[pid] = dlg
+            self._detached[pid] = "float"
+            dlg.show()
+        box.show()
+        box.set_edit(True)   # keep the header (⋮ Reattach) reachable
+        self._save_detached()
+
+    def _reattach_panel(self, pid):
+        """Bring a detached panel back into its home tab."""
+        box = self._panels.get(pid)
+        if box is None or pid not in self._detached:
+            return
+        slot = self._detached.pop(pid)
+        if slot == "float":
+            dlg = self._float_dialogs.pop(pid, None)
+            box.setParent(None)
+            if dlg is not None:
+                dlg.deleteLater()
+        else:
+            host = _EXTRA_HOSTS.get(slot)
+            if host is not None:
+                host.host_layout().removeWidget(box)
+                box.setParent(None)
+                # show the placeholder again if the host is now empty
+                if not any(s == slot for s in self._detached.values()):
+                    host.show_placeholder(True)
+        home = self._panel_home.get(pid, "type")
+        self._panel_tab[pid] = None
+        self._move_panel_to_tab(pid, home)
+        box.set_edit(self.customize_chk.isChecked())
+        self._save_detached()
+
+    def _save_detached(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "panelDetached", json.dumps(self._detached))
+        except Exception:
+            pass
+
+    def _load_detached(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "panelDetached", "")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def _apply_detached(self):
+        """Re-detach panels that were detached last session. Runs deferred so
+        the pre-registered host dockers are already constructed."""
+        saved = self._load_detached()
+        for pid, slot in saved.items():
+            if pid in self._panels and pid not in self._detached:
+                self._detach_panel(
+                    pid, prefer=slot if isinstance(slot, int) else "float")
+        for host in _EXTRA_HOSTS.values():
+            host.set_hint(self._tr("detach_host_hint"))
+
+    def _save_panel_tabs(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "panelTabs", json.dumps(self._panel_tab))
+        except Exception:
+            pass
+
+    def _load_panel_tabs(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "panelTabs", "")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def _apply_panel_positions(self):
+        """Restore saved panel->tab placements, and reflect the current
+        customize-mode state on every panel header."""
+        self._ensure_tabbar_dnd()
+        saved = self._load_panel_tabs()
+        for pid, tid in saved.items():
+            if (pid in self._panels and tid in self._tab_layouts
+                    and tid != self._panel_tab.get(pid)):
+                self._move_panel_to_tab(pid, tid)
+        locked = set(self._load_panel_locked())
+        for pid, box in self._panels.items():
+            box.set_locked(pid in locked)
+        heights = self._load_panel_heights()
+        for pid, box in self._panels.items():
+            box.set_user_height(heights.get(pid, 0))
+        edit = self.customize_chk.isChecked()
+        for box in self._panels.values():
+            box.set_edit(edit)
+
+    def _tab_index_of(self, tid):
+        bar = self.main_tabs.tabBar()
+        for i in range(self.main_tabs.count()):
+            if bar.tabData(i) == tid:
+                return i
+        return None
+
+    def _on_enable_shapr(self, on, save=True):
+        """Show or hide the TextShapR button on the Type tab."""
+        if hasattr(self, "shaper_btn"):
+            self.shaper_btn.setVisible(bool(on))
+        if save:
+            Krita.instance().writeSetting(
+                "typer_perf", "enableShapr", "true" if on else "false")
+
+    def on_layout_reset(self):
+        """Back to the built-in tab names/order AND panel homes (unpin
+        everything, drop custom panel order + placement)."""
+        self._tab_names = {}
+        self._save_tab_names()
+        self._apply_tab_order([t for t, _nk in self._tab_defaults])
+        self._on_tab_moved()
+        self._retranslate_tabs()
+        # panels: reattach any detached, unpin, clear saved state, send home
+        for pid in list(self._detached.keys()):
+            self._reattach_panel(pid)
+        for box in self._panels.values():
+            box.set_locked(False)
+            box.set_user_height(0)
+        for pid, home in self._panel_home.items():
+            self._move_panel_to_tab(pid, home, save=False)
+        try:
+            app = Krita.instance()
+            app.writeSetting("typer_perf", "panelOrder", "")
+            app.writeSetting("typer_perf", "panelTabs", "")
+            app.writeSetting("typer_perf", "panelLocked", "")
+            app.writeSetting("typer_perf", "panelDetached", "")
+            app.writeSetting("typer_perf", "panelHeights", "")
+        except Exception:
+            pass
+        self._set_status(self._tr("layout_reset_done"))
+
+    def _load_tab_names(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "tabNames", "")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def _save_tab_names(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "tabNames", json.dumps(self._tab_names))
+        except Exception:
+            pass
+
+    def _load_tab_order(self):
+        raw = Krita.instance().readSetting("typer_perf", "tabOrder", "")
+        return [t for t in raw.split(",") if t] if raw else []
+
+    def _load_ui_tab(self):
+        try:
+            return max(0, min(3, int(
+                Krita.instance().readSetting("typer_perf", "uiTab", "0"))))
+        except Exception:
+            return 0
+
+    def _save_ui_tab(self, index):
+        try:
+            Krita.instance().writeSetting("typer_perf", "uiTab", str(int(index)))
+        except Exception:
+            pass
+
+    # -- layout / view (sizes + show/hide of docker parts) --
+
+    _QWIDGET_MAX = 16777215  # Qt's QWIDGETSIZE_MAX (no height cap)
+
+    def _view_defaults(self):
+        return {
+            "open": False,
+            "preview_show": True, "preview_h": 120,
+            "editor_show": True, "editor_h": 200,
+            "table_show": True, "table_h": 240,
+            "fonts_show": True, "fonts_h": 160,
+        }
+
+    def _load_view(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "view", "")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_view(self):
+        try:
+            Krita.instance().writeSetting("typer_perf", "view", json.dumps({
+                "open": self.view_toggle.isChecked(),
+                "preview_show": self.v_preview_chk.isChecked(),
+                "preview_h": self.v_preview_h.value(),
+                "editor_show": self.v_editor_chk.isChecked(),
+                "editor_h": self.v_editor_h.value(),
+                "table_show": self.v_table_chk.isChecked(),
+                "table_h": self.v_table_h.value(),
+                "fonts_show": self.v_fonts_chk.isChecked(),
+                "fonts_h": self.v_fonts_h.value(),
+            }))
+        except Exception:
+            pass
+
+    def _apply_view(self):
+        """Apply the chosen visibility + heights to the docker widgets.
+
+        Fixed-height parts (preview, script box, font list) are pinned to their
+        value; the JP/EN table uses the value as a minimum and still expands to
+        fill spare space. A widget's label is hidden together with it."""
+        if not hasattr(self, "preview"):
+            return
+
+        def fixed(w, h):
+            w.setMinimumHeight(h)
+            w.setMaximumHeight(h)
+
+        pv = self.v_preview_chk.isChecked()
+        self.lbl_preview.setVisible(pv)
+        self.preview.setVisible(pv)
+        fixed(self.preview, self.v_preview_h.value())
+        self.v_preview_h.setEnabled(pv)
+
+        ev = self.v_editor_chk.isChecked()
+        self.lbl_script.setVisible(ev)
+        self.editor.setVisible(ev)
+        fixed(self.editor, self.v_editor_h.value())
+        self.v_editor_h.setEnabled(ev)
+
+        tv = self.v_table_chk.isChecked()
+        self.lbl_align.setVisible(tv)
+        self.table.setVisible(tv)
+        self.table.setMinimumHeight(self.v_table_h.value())
+        self.table.setMaximumHeight(self._QWIDGET_MAX)
+        self.v_table_h.setEnabled(tv)
+
+        fv = self.v_fonts_chk.isChecked()
+        self.lbl_font.setVisible(fv)
+        self.font_picker.setVisible(fv)
+        fixed(self.font_picker.list, self.v_fonts_h.value())
+        self.v_fonts_h.setEnabled(fv)
+
+    def _on_view_toggle(self, checked):
+        self.view_box.setVisible(checked)
+        self._save_view()
+
+    def _on_view_changed(self, *_a):
+        self._apply_view()
+        self._save_view()
+
+    def _on_view_reset(self):
+        d = self._view_defaults()
+        widgets = (self.v_preview_chk, self.v_editor_chk, self.v_table_chk,
+                   self.v_fonts_chk, self.v_preview_h, self.v_editor_h,
+                   self.v_table_h, self.v_fonts_h)
+        for w in widgets:
+            w.blockSignals(True)
+        self.v_preview_chk.setChecked(d["preview_show"])
+        self.v_preview_h.setValue(d["preview_h"])
+        self.v_editor_chk.setChecked(d["editor_show"])
+        self.v_editor_h.setValue(d["editor_h"])
+        self.v_table_chk.setChecked(d["table_show"])
+        self.v_table_h.setValue(d["table_h"])
+        self.v_fonts_chk.setChecked(d["fonts_show"])
+        self.v_fonts_h.setValue(d["fonts_h"])
+        for w in widgets:
+            w.blockSignals(False)
+        self._apply_view()
+        self._save_view()
+
+    # -- actions --
+
+    def _load_recents(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "recentFonts", "")
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def _save_recents(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "recentFonts",
+                json.dumps(self.font_picker.recents()),
+            )
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "settings", "")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def _collect_settings(self):
+        return {
+            "size": self.size_spin.value(),
+            "pad": self.pad_spin.value(),
+            "spacing": self.spacing_spin.value(),
+            "auto": self.auto_chk.isChecked(),
+            "round": self.round_chk.isChecked(),
+            "outline": self.outline_chk.isChecked(),
+            "outline_w": self.outline_spin.value(),
+            "bold": self.bold_chk.isChecked(),
+            "italic": self.italic_chk.isChecked(),
+            "underline": self.underline_chk.isChecked(),
+            "align": self.align_combo.currentData() or "center",
+            "valign": self.valign_combo.currentData() or "middle",
+            "case": self.case_combo.currentData() or "none",
+            "tidy": self.tidy_chk.isChecked(),
+            "color": self._color.name(),
+            "outline_color": self._outline_color.name(),
+            "shadow": self.shadow_chk.isChecked(),
+            "shadow_x": self.shadow_x_spin.value(),
+            "shadow_y": self.shadow_y_spin.value(),
+            "shadow_color": self._shadow_color.name(),
+            "hyphenate": self.hyph_chk.isChecked(),
+            "hyph_lang": self.hyph_lang_combo.currentData() or "auto",
+        }
+
+    def _save_settings(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "settings", json.dumps(self._collect_settings()))
+        except Exception:
+            pass
+
+    def _apply_settings(self, d):
+        if not isinstance(d, dict) or not d:
+            return
+        try:
+            if "size" in d:
+                self.size_spin.setValue(int(d["size"]))
+            if "pad" in d:
+                self.pad_spin.setValue(int(d["pad"]))
+            if "spacing" in d:
+                self.spacing_spin.setValue(int(d["spacing"]))
+            if "auto" in d:
+                self.auto_chk.setChecked(bool(d["auto"]))
+            if "round" in d:
+                self.round_chk.setChecked(bool(d["round"]))
+            if "outline" in d:
+                self.outline_chk.setChecked(bool(d["outline"]))
+            if "outline_w" in d:
+                self.outline_spin.setValue(int(d["outline_w"]))
+            if "bold" in d:
+                self.bold_chk.setChecked(bool(d["bold"]))
+            if "italic" in d:
+                self.italic_chk.setChecked(bool(d["italic"]))
+            if "underline" in d:
+                self.underline_chk.setChecked(bool(d["underline"]))
+            if d.get("case") in ("none", "upper", "lower"):
+                self.case_combo.setCurrentIndex(
+                    {"none": 0, "upper": 1, "lower": 2}[d["case"]])
+            elif "caps" in d:                       # old presets/settings
+                self.case_combo.setCurrentIndex(1 if d["caps"] else 0)
+            if "tidy" in d:
+                self.tidy_chk.setChecked(bool(d["tidy"]))
+            if d.get("align") in ("left", "center", "right"):
+                idx = {"left": 0, "center": 1, "right": 2}[d["align"]]
+                self.align_combo.setCurrentIndex(idx)
+            if d.get("valign") in ("top", "middle", "bottom"):
+                vidx = {"top": 0, "middle": 1, "bottom": 2}[d["valign"]]
+                self.valign_combo.setCurrentIndex(vidx)
+            if "color" in d:
+                self._color = QColor(d["color"])
+                self._update_color_btn()
+            if "outline_color" in d:
+                self._outline_color = QColor(d["outline_color"])
+                self._update_outline_btn()
+            if "shadow" in d:
+                self.shadow_chk.setChecked(bool(d["shadow"]))
+            if "shadow_x" in d:
+                self.shadow_x_spin.setValue(int(d["shadow_x"]))
+            if "shadow_y" in d:
+                self.shadow_y_spin.setValue(int(d["shadow_y"]))
+            if "shadow_color" in d:
+                self._shadow_color = QColor(d["shadow_color"])
+                self._update_shadow_btn()
+            if "hyphenate" in d:
+                self.hyph_chk.setChecked(bool(d["hyphenate"]))
+            if d.get("hyph_lang") in ("auto", "en", "de"):
+                hidx = {"auto": 0, "en": 1, "de": 2}[d["hyph_lang"]]
+                self.hyph_lang_combo.setCurrentIndex(hidx)
+        except Exception:
+            pass
+
+    # -- presets: three levels (Manga -> Character -> style preset) --
+
+    _CFG_KEYS = ("size", "font", "color", "align", "valign", "case",
+                 "caps", "outline", "shadow", "spacing", "pad")
+
+    def _is_cfg(self, d):
+        return isinstance(d, dict) and any(k in d for k in self._CFG_KEYS)
+
+    def _normalize(self, data):
+        """Convert any old format into the 3-level structure
+        {Manga: {Character: {Name: config}}}.
+        - flat     {Name: config}                       -> default Manga/Character
+        - 2-level  {Group: {Name: config}}              -> Group as Manga, default Character
+        - 3-level  {Manga: {Character: {Name: config}}} -> unchanged
+        """
+        if not isinstance(data, dict) or not data:
+            return {}
+        md = self._tr("group_default")
+        cd = self._tr("char_default")
+        if any(self._is_cfg(v) for v in data.values()):
+            return {md: {cd: {str(n): c for n, c in data.items()
+                              if isinstance(c, dict)}}}
+        two = False
+        for v in data.values():
+            if isinstance(v, dict) and any(self._is_cfg(vv) for vv in v.values()):
+                two = True
+                break
+        if two:
+            out = {}
+            for g, presets in data.items():
+                if isinstance(presets, dict):
+                    out[str(g)] = {cd: {str(n): c for n, c in presets.items()
+                                        if isinstance(c, dict)}}
+            return out
+        out = {}
+        for m, chars in data.items():
+            if not isinstance(chars, dict):
+                continue
+            out[str(m)] = {}
+            for ch, presets in chars.items():
+                if isinstance(presets, dict):
+                    out[str(m)][str(ch)] = {str(n): c for n, c in presets.items()
+                                            if isinstance(c, dict)}
+        return out
+
+    def _load_groups(self):
+        try:
+            raw = Krita.instance().readSetting("typer_perf", "presets", "")
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        return self._normalize(data)
+
+    def _save_groups(self):
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "presets", json.dumps(self._groups))
+        except Exception:
+            pass
+
+    def _ensure_levels(self):
+        """Ensure at least one Manga + one Character, and keep the selection valid."""
+        if not self._groups:
+            self._groups = {self._tr("group_default"): {}}
+        if self._group not in self._groups:
+            self._group = sorted(self._groups.keys(), key=lambda s: s.lower())[0]
+        chars = self._groups[self._group]
+        if not chars:
+            chars[self._tr("char_default")] = {}
+        if self._char not in chars:
+            self._char = sorted(chars.keys(), key=lambda s: s.lower())[0]
+
+    def _cur_chars(self):
+        return self._groups.get(self._group, {})
+
+    def _cur_presets(self):
+        return self._cur_chars().get(self._char, {})
+
+    def _collect_preset(self):
+        p = self._collect_settings()
+        p["font"] = self.font_picker.currentFamily() or ""
+        return p
+
+    def _apply_preset(self, p):
+        if not isinstance(p, dict):
+            return
+        self._apply_settings(p)
+        fam = p.get("font")
+        if fam:
+            self.font_picker.setCurrentFamily(fam)
+        self._on_outline_toggle()
+        self._on_shadow_toggle()
+        self._on_auto_toggle()
+
+    # ---- Manga level ----
+    def _refresh_groups_combo(self, select=None):
+        self._ensure_levels()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        for g in sorted(self._groups.keys(), key=lambda s: s.lower()):
+            self.group_combo.addItem(g, g)
+        target = select or self._group
+        idx = self.group_combo.findData(target)
+        if idx >= 0:
+            self.group_combo.setCurrentIndex(idx)
+            self._group = target
+        self.group_combo.blockSignals(False)
+
+    def _on_group_selected(self):
+        g = self.group_combo.currentData()
+        if g is not None and g in self._groups:
+            self._group = g
+            self._char = ""
+            self._refresh_chars_combo()
+            self._refresh_presets_combo()
+
+    def on_group_new(self):
+        name, ok = QInputDialog.getText(
+            self.widget(), self._tr("group_new_dlg"),
+            self._tr("group_name_prompt"))
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            self._set_status(self._tr("st_group_name_empty"), error=True)
+            return
+        if name not in self._groups:
+            self._groups[name] = {self._tr("char_default"): {}}
+        self._group = name
+        self._char = ""
+        self._save_groups()
+        self._refresh_groups_combo(select=name)
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_group_saved").format(name=name))
+
+    def on_group_delete(self):
+        g = self.group_combo.currentData()
+        if g is None or g not in self._groups:
+            self._set_status(self._tr("st_group_none"), error=True)
+            return
+        del self._groups[g]
+        self._char = ""
+        self._ensure_levels()
+        self._save_groups()
+        self._refresh_groups_combo()
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_group_deleted").format(name=g))
+
+    # ---- Character level ----
+    def _refresh_chars_combo(self, select=None):
+        self._ensure_levels()
+        self.char_combo.blockSignals(True)
+        self.char_combo.clear()
+        for ch in sorted(self._cur_chars().keys(), key=lambda s: s.lower()):
+            self.char_combo.addItem(ch, ch)
+        target = select or self._char
+        idx = self.char_combo.findData(target)
+        if idx >= 0:
+            self.char_combo.setCurrentIndex(idx)
+            self._char = target
+        self.char_combo.blockSignals(False)
+
+    def _on_char_selected(self):
+        ch = self.char_combo.currentData()
+        if ch is not None and ch in self._cur_chars():
+            self._char = ch
+            self._apply_default_preset()   # auto-select the default style
+
+    def on_char_new(self):
+        name, ok = QInputDialog.getText(
+            self.widget(), self._tr("char_new_dlg"),
+            self._tr("char_name_prompt"))
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            self._set_status(self._tr("st_char_name_empty"), error=True)
+            return
+        self._ensure_levels()
+        if name not in self._groups[self._group]:
+            self._groups[self._group][name] = {}
+        self._char = name
+        self._save_groups()
+        self._refresh_chars_combo(select=name)
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_char_saved").format(name=name))
+
+    def on_char_delete(self):
+        ch = self.char_combo.currentData()
+        if ch is None or ch not in self._cur_chars():
+            self._set_status(self._tr("st_char_none"), error=True)
+            return
+        del self._groups[self._group][ch]
+        self._char = ""
+        self._ensure_levels()
+        self._save_groups()
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_char_deleted").format(name=ch))
+
+    # ---- style preset level ----
+    def _refresh_presets_combo(self, select=None):
+        """Rebuild the preset dropdown. Character mode lists the current
+        character's presets (item data = name); simple mode lists every preset
+        of the manga (item data = (character, name), duplicate names get a
+        '(Character)' suffix)."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(self._tr("preset_none"), None)
+        if self._by_char():
+            for name in sorted(self._cur_presets().keys(),
+                               key=lambda s: s.lower()):
+                self.preset_combo.addItem(name, name)
+        else:
+            for label, ch, name in LP.flatten_presets(self._cur_chars()):
+                self.preset_combo.addItem(label, (ch, name))
+        if select is not None:
+            # manual match: findData compares QVariants, which is unreliable
+            # for python tuples
+            for i in range(self.preset_combo.count()):
+                if self.preset_combo.itemData(i) == select:
+                    self.preset_combo.setCurrentIndex(i)
+                    break
+        self.preset_combo.blockSignals(False)
+
+    def _on_preset_selected(self):
+        ch, name = self._preset_ref(self.preset_combo.currentData())
+        presets = self._cur_chars().get(ch, {})
+        if name and name in presets:
+            self._apply_preset(presets[name])
+            self._record_preset_usage(self._group, ch, name)
+            self._set_status(self._tr("st_preset_applied").format(name=name))
+
+    def on_preset_save(self):
+        _ch, current = self._preset_ref(self.preset_combo.currentData())
+        name, ok = QInputDialog.getText(
+            self.widget(), self._tr("preset_name_dlg"),
+            self._tr("preset_name_prompt"), text=current)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            self._set_status(self._tr("st_preset_name_empty"), error=True)
+            return
+        self._ensure_levels()
+        # simple mode saves into the manga's default bucket character
+        target = self._char if self._by_char() else self._bucket_char()
+        self._groups[self._group].setdefault(target, {})[name] = \
+            self._collect_preset()
+        self._save_groups()
+        self._refresh_presets_combo(
+            select=name if self._by_char() else (target, name))
+        self._set_status(self._tr("st_preset_saved_in").format(
+            name=name, char=target))
+
+    def on_preset_delete(self):
+        ch, name = self._preset_ref(self.preset_combo.currentData())
+        presets = self._cur_chars().get(ch, {})
+        if not name or name not in presets:
+            self._set_status(self._tr("st_preset_none"), error=True)
+            return
+        del self._groups[self._group][ch][name]
+        self._save_groups()
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_preset_deleted").format(name=name))
+
+    def on_preset_export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self.widget(), self._tr("preset_file_save"),
+            "typer_presets.json", self._tr("preset_filter"))
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._groups, fh, ensure_ascii=False, indent=2)
+            n = sum(len(pr) for chars in self._groups.values()
+                    for pr in chars.values())
+            self._set_status(self._tr("st_preset_exported").format(n=n))
+        except Exception as exc:
+            self._set_status(self._tr("st_read_fail").format(exc=exc), error=True)
+
+    def on_preset_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.widget(), self._tr("preset_file_open"),
+            "", self._tr("preset_filter"))
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("not a preset object")
+        except Exception:
+            self._set_status(self._tr("st_preset_import_fail"), error=True)
+            return
+        incoming = self._normalize(data)
+        count = 0
+        for m, chars in incoming.items():
+            dst_m = self._groups.setdefault(str(m), {})
+            for ch, presets in chars.items():
+                dst_c = dst_m.setdefault(str(ch), {})
+                for name, cfg in presets.items():
+                    dst_c[str(name)] = cfg
+                    count += 1
+        self._save_groups()
+        self._refresh_groups_combo()
+        self._refresh_chars_combo()
+        self._refresh_presets_combo()
+        self._set_status(self._tr("st_preset_imported").format(n=count))
+
+    # ==================================================================
+    #  Script tabs (several loaded scripts at once)
+    # ==================================================================
+    def _session_index(self, sid):
+        """Index of the session with id `sid` in self._sessions, or -1."""
+        for i, s in enumerate(self._sessions):
+            if s["id"] == sid:
+                return i
+        return -1
+
+    def _tab_index(self, sid):
+        """Index of the tab carrying session id `sid`, or -1."""
+        for i in range(self.script_tabs.count()):
+            if self.script_tabs.tabData(i) == sid:
+                return i
+        return -1
+
+    def _snapshot_active(self):
+        """Save the live editor text + parse state into the active session."""
+        i = self._session_index(self._active_sid)
+        if i < 0:
+            return
+        s = self._sessions[i]
+        s["text"] = self.editor.toPlainText()
+        s["pairs"] = self._pairs
+        s["pair_pages"] = self._pair_pages
+        s["pages"] = self._pages
+        s["index"] = self._index
+        s["done"] = self._done
+        s["path"] = self._script_path
+
+    def _restore_by_sid(self, sid):
+        """Load the session with id `sid` into the live view (no re-parsing)."""
+        i = self._session_index(sid)
+        if i < 0:
+            return
+        s = self._sessions[i]
+        self._active_sid = sid
+        self._script_path = s["path"]
+        self._pairs = s["pairs"]
+        self._pair_pages = s["pair_pages"]
+        self._pages = s["pages"]
+        self._index = s["index"]
+        self._done = s["done"]
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(s["text"])
+        self.editor.blockSignals(False)
+        self._populate_table()
+        self._repaint_done()
+        self._refresh_pages_combo()
+        self._refresh_view()
+
+    def _add_session(self, name, path, text, do_analyze):
+        """Create a new session + tab and make it active."""
+        self._snapshot_active()
+        sid = self._next_sid
+        self._next_sid += 1
+        self._sessions.append({
+            "id": sid, "name": name, "path": path, "text": text,
+            "pairs": [], "pair_pages": [], "pages": [], "index": 0, "done": set(),
+        })
+        self._active_sid = sid
+        self._script_path = path
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(text)
+        self.editor.blockSignals(False)
+        if do_analyze:
+            self.analyze()                 # fills the live state from the text
+        else:
+            self._pairs, self._pair_pages, self._pages = [], [], []
+            self._index = 0
+            self._done = set()
+            self._populate_table()
+            self._refresh_pages_combo()
+            self._refresh_view()
+        self._snapshot_active()            # store the parsed state in the session
+        self.script_tabs.blockSignals(True)
+        idx = self.script_tabs.addTab(name)
+        self.script_tabs.setTabData(idx, sid)
+        self.script_tabs.setTabToolTip(idx, path or name)
+        self.script_tabs.setCurrentIndex(idx)
+        self.script_tabs.blockSignals(False)
+
+    def _new_untitled(self):
+        """Add an empty, unnamed script tab."""
+        name = LP.unique_untitled([s["name"] for s in self._sessions],
+                                  base=self._tr("tab_untitled"))
+        self._add_session(name, "", "", do_analyze=False)
+
+    def _init_first_session(self):
+        """Ensure exactly one tab exists at startup."""
+        if not self._sessions:
+            self._new_untitled()
+
+    def _on_tab_changed(self, tab_i):
+        if tab_i < 0:
+            return
+        sid = self.script_tabs.tabData(tab_i)
+        if sid is None or sid == self._active_sid:
+            return
+        self._snapshot_active()
+        self._restore_by_sid(sid)
+
+    def _close_tab(self, tab_i):
+        sid = self.script_tabs.tabData(tab_i)
+        if sid is None:
+            return
+        self._snapshot_active()
+        i = self._session_index(sid)
+        if i >= 0:
+            del self._sessions[i]
+        self.script_tabs.blockSignals(True)
+        self.script_tabs.removeTab(tab_i)
+        self.script_tabs.blockSignals(False)
+        if not self._sessions:
+            self._active_sid = None
+            self._new_untitled()           # never leave zero tabs
+            return
+        # activate whatever tab Qt now shows as current
+        cur = self.script_tabs.currentIndex()
+        self._active_sid = None            # force a full restore
+        self._restore_by_sid(self.script_tabs.tabData(cur))
+
+    def _rename_tab(self, tab_i):
+        if tab_i < 0:
+            return
+        sid = self.script_tabs.tabData(tab_i)
+        i = self._session_index(sid)
+        if i < 0:
+            return
+        name, ok = QInputDialog.getText(
+            self.widget(), self._tr("tab_rename_dlg"),
+            self._tr("tab_rename_prompt"), text=self._sessions[i]["name"])
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self._sessions[i]["name"] = name
+        self.script_tabs.setTabText(tab_i, name)
+
+    def on_load(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.widget(),
+            self._tr("file_dlg"),
+            "",
+            self._tr("file_filter"),
+        )
+        if not path:
+            return
+        # already open? -> just switch to its tab instead of opening twice
+        existing = LP.find_session_by_path(self._sessions, path)
+        if existing >= 0:
+            self.script_tabs.setCurrentIndex(
+                self._tab_index(self._sessions[existing]["id"]))
+            self._set_status(self._tr("st_already_open").format(
+                name=os.path.basename(path)))
+            return
+        try:
+            text = read_script(path)
+        except FileNotFoundError:
+            self._set_status(self._tr("st_not_found"), error=True)
+            return
+        except zipfile.BadZipFile:
+            self._set_status(self._tr("st_bad_zip"), error=True)
+            return
+        except KeyError:
+            self._set_status(self._tr("st_no_content"), error=True)
+            return
+        except OldDocError as exc:
+            self._set_status(self._tr("st_old_doc").format(fmt=exc.fmt),
+                             error=True)
+            return
+        except Exception as exc:
+            self._set_status(self._tr("st_read_fail").format(exc=exc), error=True)
+            return
+
+        self._add_session(LP.default_tab_label(path), path, text, do_analyze=True)
+        self._set_status(self._tr("st_loaded").format(
+            name=os.path.basename(path), n=len(self._pairs)))
+
+    def analyze(self):
+        lines = split_lines(self.editor.toPlainText(), self.skip_empty.isChecked())
+        # pair_lines_paged also pulls out the "Page N" markers and tells us which
+        # page every unit belongs to (so we can show it and jump between pages).
+        self._pairs, self._pair_pages, self._pages = LP.pair_lines_paged(lines)
+        self._index = 0
+        self._done = set()
+        # auto-switch the manga before the first line is shown (auto-character
+        # then runs against the right character set)
+        self._maybe_auto_manga(self.editor.toPlainText(), self._script_path)
+        self._populate_table()
+        self._refresh_pages_combo()
+        self._refresh_view()
+
+    def _populate_table(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self._pairs))
+        for r, (ja, en) in enumerate(self._pairs):
+            self.table.setItem(r, 0, QTableWidgetItem(ja))
+            self.table.setItem(r, 1, QTableWidgetItem(en))
+        self.table.blockSignals(False)
+        self.table.resizeRowsToContents()
+
+    def _on_table_select(self):
+        model = self.table.selectionModel()
+        if model is None:
+            return
+        rows = model.selectedRows()
+        if rows:
+            self._index = rows[0].row()
+            self._show_current()
+
+    def _on_table_double(self, *args):
+        # double-click on a row = insert immediately
+        self.on_insert()
+
+    def on_prev(self):
+        if self._pairs:
+            self._index = (self._index - 1) % len(self._pairs)
+        self._refresh_view()
+
+    def on_next(self):
+        if self._pairs:
+            self._index = (self._index + 1) % len(self._pairs)
+        self._refresh_view()
+
+    def on_reset_progress(self):
+        self._done = set()
+        self._repaint_done()
+        self._show_current()
+        self._set_status(self._tr("st_progress_reset"))
+
+    # -- pages ("Page N" markers in the script) --
+
+    def _page_labels(self):
+        """Ordered list of the non-empty page labels found in the script."""
+        return [label for label, _first in self._pages if label]
+
+    def _current_page_label(self):
+        """Page label of the currently active unit ('' if before page 1)."""
+        if 0 <= self._index < len(self._pair_pages):
+            return self._pair_pages[self._index]
+        return ""
+
+    def _refresh_pages_combo(self):
+        """Rebuild the jump-to-page combo and show/hide the whole page row
+        depending on whether the script actually contains "Page" markers."""
+        labels = self._page_labels()
+        self.page_combo.blockSignals(True)
+        self.page_combo.clear()
+        for label, first in self._pages:
+            if not label:
+                continue
+            self.page_combo.addItem(
+                self._tr("page_item").format(label=label), first)
+        self.page_combo.blockSignals(False)
+        has_pages = bool(labels)
+        self.lbl_page.setVisible(has_pages)
+        self.page_combo.setVisible(has_pages)
+        self.page_status.setVisible(has_pages)
+        self._sync_page_indicator()
+
+    def on_jump_page(self, combo_index):
+        """Jump to the first unit of the selected page."""
+        first = self.page_combo.itemData(combo_index)
+        if first is None:
+            return
+        self._index = int(first)
+        self._refresh_view()
+
+    def _sync_page_indicator(self):
+        """Update the "Page X / N" label and keep the combo in sync with the
+        page of the current unit (without triggering a jump)."""
+        labels = self._page_labels()
+        if not labels:
+            self.page_status.setText("")
+            return
+        cur = self._current_page_label()
+        if cur in labels:
+            self.page_status.setText(self._tr("page_status").format(
+                cur=cur, n=len(labels)))
+            self.page_combo.blockSignals(True)
+            self.page_combo.setCurrentIndex(labels.index(cur))
+            self.page_combo.blockSignals(False)
+        else:
+            self.page_status.setText(self._tr("page_status_intro"))
+
+    def _done_brush(self):
+        # subtle green that works in both the light and dark Krita theme
+        c = QColor(70, 160, 90)
+        c.setAlpha(60)
+        return c
+
+    def _mark_done_row(self, row):
+        if not (0 <= row < self.table.rowCount()):
+            return
+        brush = self._done_brush()
+        for col in range(self.table.columnCount()):
+            it = self.table.item(row, col)
+            if it is not None:
+                it.setBackground(brush)
+
+    def _repaint_done(self):
+        empty = QColor(0, 0, 0, 0)
+        for row in range(self.table.rowCount()):
+            for col in range(self.table.columnCount()):
+                it = self.table.item(row, col)
+                if it is not None:
+                    it.setBackground(self._done_brush() if row in self._done else empty)
+
+    def on_pick_color(self):
+        col = QColorDialog.getColor(self._color, self.widget(),
+                                    self._tr("color_dlg"))
+        if col.isValid():
+            self._color = col
+            self._update_color_btn()
+
+    def on_pick_outline_color(self):
+        col = QColorDialog.getColor(self._outline_color, self.widget(),
+                                    self._tr("outline_color_dlg"))
+        if col.isValid():
+            self._outline_color = col
+            self._update_outline_btn()
+
+    def _on_auto_toggle(self):
+        auto = self.auto_chk.isChecked()
+        self.size_label.setText(
+            self._tr("size_max") if auto else self._tr("size_fixed"))
+        self.pad_spin.setEnabled(auto)
+        self.round_chk.setEnabled(auto)
+        if hasattr(self, "hyph_chk"):
+            self.hyph_chk.setEnabled(auto)
+            self.hyph_lang_combo.setEnabled(auto and self.hyph_chk.isChecked())
+        self._update_text_preview()
+
+    def _on_hyph_toggle(self):
+        self.hyph_lang_combo.setEnabled(
+            self.auto_chk.isChecked() and self.hyph_chk.isChecked())
+        self._update_text_preview()
+
+    def _resolve_hyph(self, code, text):
+        """Resolve a hyphenation-language code. An explicit choice wins.
+        'Auto' prefers the UI language (when its patterns are bundled), then
+        a simple accent heuristic, then English."""
+        if code and code != "auto":
+            return code
+        if self._lang in L.HYPH_LANGS:
+            return self._lang
+        return self._accent_lang(text) or "en"
+
+    def _hyph_lang_for(self, text):
+        """Hyphenation language for the CURRENT UI choice."""
+        return self._resolve_hyph(
+            self.hyph_lang_combo.currentData() or "auto", text)
+
+    @staticmethod
+    def _accent_lang(text):
+        """Very rough language guess from a few distinctive accents (only used
+        when the UI language has no bundled patterns). None if undecided."""
+        t = text or ""
+        if any(c in "ñ¡¿" for c in t):
+            return "es"
+        if any(c in "ãõ" for c in t):
+            return "pt"
+        if any(c in "œ" for c in t):
+            return "fr"
+        if any(c in "äöüßÄÖÜ" for c in t):
+            return "de"
+        return None
+
+    def _current_text(self):
+        # prefer the (possibly edited) content of the active field
+        txt = self.active_edit.toPlainText()
+        if txt.strip():
+            return txt
+        if not self._pairs:
+            return ""
+        return LP.unit_text(self._pairs[self._index])
+
+    def on_bold_selection(self):
+        """Toggle bold (``**...**``) on the selected words in the active field."""
+        tc = self.active_edit.textCursor()
+        start, end = tc.selectionStart(), tc.selectionEnd()
+        if start == end:
+            self._set_status(self._tr("st_bold_no_sel"))
+            return
+        text = self.active_edit.toPlainText()
+        new, ns, ne = toggle_bold(text, start, end)
+        self.active_edit.setPlainText(new)          # triggers textChanged -> preview
+        cur = self.active_edit.textCursor()
+        cur.setPosition(max(0, ns))
+        cur.setPosition(max(0, ne), QTextCursor.KeepAnchor)
+        self.active_edit.setTextCursor(cur)
+        self.active_edit.setFocus()
+
+    def _lite_mode(self):
+        """True when the low-power 'Lite mode' is active (weak-PC build)."""
+        return bool(getattr(self, "_lite", False))
+
+    def _update_text_preview(self):
+        """Request a preview refresh. Debounced: rapid edits restart a short
+        timer so only the final change triggers the (expensive) repaint. In
+        Lite mode the preview does not auto-refresh at all — it is marked stale
+        and only redrawn when the user clicks Refresh."""
+        if not hasattr(self, "preview"):
+            return
+        if self._lite_mode():
+            self._preview_dirty = True
+            self._sync_preview_controls()
+            return
+        self._preview_timer.start()      # (re)start the debounce window
+
+    def _do_update_text_preview(self):
+        """The real repaint, invoked from the debounce timer or a manual
+        Refresh click."""
+        if not hasattr(self, "preview"):
+            return
+        try:
+            self.preview.set_text(self._current_text())
+        except Exception:
+            pass
+        self._preview_dirty = False
+        self._sync_preview_controls()
+
+    def _refresh_preview_now(self):
+        """Manual, immediate preview refresh (Refresh button / mode switch)."""
+        self._preview_timer.stop()
+        self._do_update_text_preview()
+
+    def _sync_preview_controls(self):
+        """Show the Refresh button + 'stale' hint only in Lite mode, and only
+        while the preview is out of date."""
+        if not hasattr(self, "preview_refresh_btn"):
+            return
+        lite = self._lite_mode()
+        self.preview_refresh_btn.setVisible(lite)
+        self.preview_refresh_btn.setEnabled(self._preview_dirty)
+        if lite and self._preview_dirty:
+            self.lbl_preview.setText(self._tr("preview_stale"))
+        else:
+            self.lbl_preview.setText("")
+
+    def _on_lite_toggle(self, checked):
+        """Flip Lite mode: persist it, update the overlay's scaling quality,
+        and refresh the preview once so it reflects the new setting."""
+        self._lite = bool(checked)
+        try:
+            Krita.instance().writeSetting(
+                "typer_perf", "liteMode", "true" if checked else "false")
+        except Exception:
+            pass
+        # Leaving Lite mode should immediately show a fresh preview; entering it
+        # keeps whatever is on screen and just exposes the manual controls.
+        if not self._lite:
+            self._refresh_preview_now()
+        else:
+            self._sync_preview_controls()
+
+    def _wire_preview(self):
+        """Connect every control that affects appearance to the preview
+        refresh."""
+        try:
+            self.font_picker.list.currentItemChanged.connect(
+                lambda *a: self._update_text_preview())
+        except Exception:
+            pass
+        for chk in (self.bold_chk, self.italic_chk, self.underline_chk,
+                    self.tidy_chk, self.outline_chk,
+                    self.shadow_chk):
+            chk.toggled.connect(lambda *a: self._update_text_preview())
+        for combo in (self.align_combo, self.valign_combo, self.case_combo):
+            combo.currentIndexChanged.connect(
+                lambda *a: self._update_text_preview())
+        for spin in (self.size_spin, self.pad_spin, self.spacing_spin,
+                     self.outline_spin, self.shadow_x_spin, self.shadow_y_spin):
+            spin.valueChanged.connect(lambda *a: self._update_text_preview())
+
+    def on_insert(self):
+        if not self._pairs:
+            self._set_status(self._tr("st_nothing"), error=True)
+            return
+        family = self.font_picker.currentFamily()
+        if not family:
+            self._set_status(self._tr("st_no_font"), error=True)
+            return
+        text = self._current_text()
+        # default shape from the auto-fit + round toggles
+        shape = "ellipse" if (self.auto_chk.isChecked()
+                              and self.round_chk.isChecked()) else "rect"
+        box = None
+        ok, key, fmt = insert_text_layer(
+            text,
+            family,
+            self.size_spin.value(),
+            self._color,
+            self.auto_chk.isChecked(),
+            self.size_spin.value(),
+            self.pad_spin.value() / 100.0,
+            self.spacing_spin.value() / 100.0,
+            self.outline_chk.isChecked(),
+            self._outline_color,
+            self.outline_spin.value(),
+            self.bold_chk.isChecked(),
+            self.italic_chk.isChecked(),
+            self.underline_chk.isChecked(),
+            self.align_combo.currentData() or "center",
+            self.case_combo.currentData() or "none",
+            self.tidy_chk.isChecked(),
+            shape,
+            self.shadow_chk.isChecked(),
+            self._shadow_color,
+            self.shadow_x_spin.value(),
+            self.shadow_y_spin.value(),
+            self.valign_combo.currentData() or "middle",
+            self._index + 1,
+            hyphenate=self.hyph_chk.isChecked(),
+            hyph_lang=self._hyph_lang_for(text),
+            replace_existing=self.replace_chk.isChecked(),
+            box=box,
+        )
+        self._set_status(self._insert_msg(key, fmt), error=not ok)
+        if ok:
+            self.font_picker.noteUsed(family)
+            self._save_recents()
+            self._save_settings()
+            self._done.add(self._index)
+            self._mark_done_row(self._index)
+            if self._index < len(self._pairs) - 1:
+                self._index += 1
+            self._refresh_view()
+
+    def _insert_msg(self, key, fmt):
+        """Status message for an insert result; notes when old layer(s) of the
+        same line were replaced."""
+        msg = self._tr(key).format(**fmt)
+        if fmt.get("replaced"):
+            msg += "  " + self._tr("st_replaced")
+        return msg
+
+    def on_open_shaper(self):
+        """Open the TextShapR picker for the current line."""
+        dlg = TextShapRDialog(self)
+        dlg.exec_()
+
+    def insert_arrangement(self, cand, advance):
+        """Insert a TextShapR candidate through the normal insert path. The
+        chosen line breaks (and any hyphens) are baked into the text as hard
+        breaks, and the size is capped at the candidate's px, so the layer
+        matches the thumbnail exactly. Returns True on success."""
+        family = self.font_picker.currentFamily()
+        if not family:
+            self._set_status(self._tr("st_no_font"), error=True)
+            return False
+        baked = "\n".join(L.runs_markup(runs) for runs in cand["lines"])
+        ok, key, fmt = insert_text_layer(
+            baked,
+            family,
+            cand["px"],
+            self._color,
+            True,                  # auto-fit (respects the baked hard breaks)
+            cand["px"],            # cap at the candidate's size = WYSIWYG
+            self.pad_spin.value() / 100.0,
+            self.spacing_spin.value() / 100.0,
+            self.outline_chk.isChecked(),
+            self._outline_color,
+            self.outline_spin.value(),
+            self.bold_chk.isChecked(),
+            self.italic_chk.isChecked(),
+            self.underline_chk.isChecked(),
+            self.align_combo.currentData() or "center",
+            "none",                # case/tidy were applied at candidate time
+            False,
+            "rect",                # breaks are baked in -> rect reproduces them
+            self.shadow_chk.isChecked(),
+            self._shadow_color,
+            self.shadow_x_spin.value(),
+            self.shadow_y_spin.value(),
+            self.valign_combo.currentData() or "middle",
+            self._index + 1,
+            hyphenate=False,       # hyphens are already in the baked text
+            replace_existing=self.replace_chk.isChecked(),
+        )
+        self._set_status(self._insert_msg(key, fmt), error=not ok)
+        if ok:
+            self.font_picker.noteUsed(family)
+            self._save_recents()
+            self._save_settings()
+            if self._pairs:
+                self._done.add(self._index)
+                self._mark_done_row(self._index)
+                if advance and self._index < len(self._pairs) - 1:
+                    self._index += 1
+                self._refresh_view()
+        return ok
+
+    def _show_current(self):
+        total = len(self._pairs)
+        if total == 0:
+            self.counter.setText("0 / 0")
+            self.active_edit.blockSignals(True)
+            self.active_edit.setPlainText("")
+            self.active_edit.blockSignals(False)
+            self.jp_ref.setText("")
+            self._sync_page_indicator()
+            self._update_text_preview()
+            return
+        self.counter.setText("{} / {}   \u2713 {}".format(
+            self._index + 1, total, len(self._done)))
+        ja, en = self._pairs[self._index]
+        main_txt = en if en.strip() else ja
+        # optional: pick the character from a "Name:" speaker prefix and strip it
+        main_txt = self._maybe_auto_character(main_txt)
+        self.active_edit.blockSignals(True)
+        self.active_edit.setPlainText(main_txt)
+        self.active_edit.blockSignals(False)
+        if en.strip() and ja.strip():
+            self.jp_ref.setText("JP: " + ja)
+        else:
+            self.jp_ref.setText("")
+        self._sync_page_indicator()
+        # refresh the live preview (textChanged is blocked here)
+        self._update_text_preview()
+
+    def _refresh_view(self):
+        self._show_current()
+        # sync the table selection without feedback
+        if self._pairs and 0 <= self._index < self.table.rowCount():
+            self.table.blockSignals(True)
+            self.table.selectRow(self._index)
+            self.table.blockSignals(False)
+
+    # mandatory override from DockWidget
+    def canvasChanged(self, canvas):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+def register():
+    instance = Krita.instance()
+    factory = DockWidgetFactory(
+        "typer_perf",
+        DockWidgetFactoryBase.DockPosition.DockRight,
+        TyperDocker,
+    )
+    instance.addDockWidgetFactory(factory)
+    # Pre-register a small pool of host dockers so detached panels can live in
+    # a real Krita-dockable window. Krita only shows dockers registered here at
+    # startup, hence the fixed pool; empty hosts just sit in the Dockers menu.
+    for slot in range(MAX_DETACH_SLOTS):
+        cls = type("TyperExtraHost%d" % (slot + 1),
+                   (TyperExtraHost,), {"_SLOT": slot})
+        instance.addDockWidgetFactory(DockWidgetFactory(
+            "typer_perf_extra_%d" % (slot + 1),
+            DockWidgetFactoryBase.DockPosition.DockRight,
+            cls,
+        ))
