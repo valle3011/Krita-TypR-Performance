@@ -331,6 +331,8 @@ LANG = {
         "shaper_auto_tip": "Fit an ellipse when the selection is a round bubble",
         "shaper_live": "Live on canvas",
         "shaper_live_tip": "Insert the picked shape onto the page as you select (replacing)",
+        "shaper_best": "\u2605 Best",
+        "shaper_best_tip": "Jump to the recommended arrangement (biggest that fits)",
         "shaper_apply": "Apply",
         "shaper_apply_next": "Apply + next",
         "shaper_empty": ("No arrangements to show. Pick a font and make sure "
@@ -743,6 +745,8 @@ LANG = {
         "shaper_auto_tip": "Ellipse fitten, wenn die Auswahl eine runde Blase ist",
         "shaper_live": "Live auf Leinwand",
         "shaper_live_tip": "Gewählte Form beim Auswählen direkt auf die Seite einfügen (ersetzend)",
+        "shaper_best": "\u2605 Bester",
+        "shaper_best_tip": "Zur empfohlenen Anordnung springen (größte, die passt)",
         "shaper_apply": "Einfügen",
         "shaper_apply_next": "Einfügen + weiter",
         "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
@@ -2233,13 +2237,14 @@ class ShapeCard(QFrame):
     clicked = pyqtSignal(int)
     W, H = 200, 120
 
-    def __init__(self, index, cand, opts, scale):
+    def __init__(self, index, cand, opts, scale, best=False):
         super().__init__()
         self._index = index
         self._cand = cand
         self._o = opts
         self._scale = scale
         self._selected = False
+        self._best = best
         self.setFixedSize(self.W, self.H)
         self.setCursor(Qt.PointingHandCursor)
 
@@ -2320,6 +2325,10 @@ class ShapeCard(QFrame):
         p.setFont(bf)
         p.drawText(self.rect().adjusted(0, 3, -6, 0),
                    Qt.AlignRight | Qt.AlignTop, str(self._index + 1))
+        if self._best:
+            p.setPen(QColor(0x2E, 0x8B, 0x57))
+            p.drawText(self.rect().adjusted(6, 3, 0, 0),
+                       Qt.AlignLeft | Qt.AlignTop, "\u2605")
         frame = QPen(QColor(0x2D, 0x8C, 0xEB), 2) if self._selected \
             else QPen(QColor(0, 0, 0, 70), 1)
         p.setPen(frame)
@@ -2425,6 +2434,10 @@ class TextShapRWidget(QWidget):
         lay.addWidget(self._brk_box)
 
         foot = QHBoxLayout()
+        self.best_btn = QPushButton(t("shaper_best"))
+        self.best_btn.setToolTip(t("shaper_best_tip"))
+        self.best_btn.clicked.connect(self._select_best)
+        foot.addWidget(self.best_btn)
         foot.addStretch(1)
         self.apply_btn = QPushButton(t("shaper_apply"))
         self.apply_btn.clicked.connect(lambda: self._apply(False))
@@ -2554,6 +2567,7 @@ class TextShapRWidget(QWidget):
         self._empty.setVisible(not have)
         self.apply_btn.setEnabled(have)
         self.apply_next_btn.setEnabled(have)
+        self.best_btn.setEnabled(have)
         self._hint.setText(self._docker._tr(
             "shaper_hint" if has_doc else "shaper_no_doc"))
         if not have:
@@ -2563,7 +2577,7 @@ class TextShapRWidget(QWidget):
         # one shared scale so the size differences between shapes stay visible
         scale = min((ShapeCard.W - 12) / box_w, (ShapeCard.H - 12) / box_h)
         for i, cand in enumerate(self._cands):
-            card = ShapeCard(i, cand, o, scale)
+            card = ShapeCard(i, cand, o, scale, best=(i == 0))
             card.clicked.connect(lambda i: self._select(i, user=True))
             self._flow.addWidget(card)
             self._cards.append(card)
@@ -2632,6 +2646,12 @@ class TextShapRWidget(QWidget):
         self._cards[self._sel].update()
         self._break_timer.start()
 
+    def _select_best(self):
+        """Pick the recommended candidate (the first, biggest-fitting)."""
+        if self._cards:
+            self._select(0, user=True)
+            self._cards[0].setFocus()
+
     def _apply(self, advance):
         if not (0 <= self._sel < len(self._cands)):
             return
@@ -2652,6 +2672,14 @@ class TextShapRWidget(QWidget):
         return None
 
     def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Left, Qt.Key_Up, Qt.Key_Right, Qt.Key_Down) \
+                and self._cards:
+            step = -1 if key in (Qt.Key_Left, Qt.Key_Up) else 1
+            cur = self._sel if self._sel >= 0 else 0
+            self._select(max(0, min(cur + step, len(self._cards) - 1)),
+                         user=True)
+            return
         digit = self._digit(event)
         if digit is not None:
             index = 9 if digit == 0 else digit - 1       # key 0 = card 10
