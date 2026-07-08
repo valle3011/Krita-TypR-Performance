@@ -327,6 +327,8 @@ LANG = {
         "shaper_hint": "Click a shape to test it. Shift+number applies and advances.",
         "shaper_break_label": "Edit line breaks (click a gap):",
         "shaper_break_tip": "Toggle a line break at this gap",
+        "shaper_auto": "Auto shape",
+        "shaper_auto_tip": "Fit an ellipse when the selection is a round bubble",
         "shaper_apply": "Apply",
         "shaper_apply_next": "Apply + next",
         "shaper_empty": ("No arrangements to show. Pick a font and make sure "
@@ -735,6 +737,8 @@ LANG = {
         "shaper_hint": "Klick testet eine Form. Umschalt+Zahl fügt ein und geht weiter.",
         "shaper_break_label": "Umbrüche bearbeiten (Lücke anklicken):",
         "shaper_break_tip": "Zeilenumbruch an dieser Lücke umschalten",
+        "shaper_auto": "Form auto",
+        "shaper_auto_tip": "Ellipse fitten, wenn die Auswahl eine runde Blase ist",
         "shaper_apply": "Einfügen",
         "shaper_apply_next": "Einfügen + weiter",
         "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
@@ -2350,6 +2354,13 @@ class TextShapRWidget(QWidget):
             self._mode_group.addButton(b, i)
             bar.addWidget(b)
         self._mode_group.buttonClicked.connect(lambda *_a: self.refresh())
+        # auto-pick the round shape when the selection is an ellipse
+        self.auto_shape_btn = QPushButton(t("shaper_auto"))
+        self.auto_shape_btn.setCheckable(True)
+        self.auto_shape_btn.setChecked(True)
+        self.auto_shape_btn.setToolTip(t("shaper_auto_tip"))
+        self.auto_shape_btn.toggled.connect(lambda *_a: self.refresh())
+        bar.addWidget(self.auto_shape_btn)
         # hyphenation is a toggle on top of the mode, not exclusive with it
         self.hyph_btn = QPushButton(t("shaper_hyph"))
         self.hyph_btn.setCheckable(True)
@@ -2424,22 +2435,47 @@ class TextShapRWidget(QWidget):
 
     def _box(self):
         """Box to fit into: the selection, else the whole image, else a
-        default box (no document open). Returns (w, h, has_doc)."""
+        default box (no document open). Returns (w, h, has_doc, shape)
+        where shape is 'round' for a roughly elliptical selection, else
+        'rect'/None."""
         try:
             doc = Krita.instance().activeDocument()
         except Exception:
             doc = None
         if doc is None:
-            return 400.0, 300.0, False
+            return 400.0, 300.0, False, None
         sel = doc.selection()
         if sel is not None:
             try:
                 w, h = float(sel.width()), float(sel.height())
                 if w > 0 and h > 0:
-                    return w, h, True
+                    return w, h, True, self._sel_shape(sel)
             except Exception:
                 pass
-        return float(doc.width()), float(doc.height()), True
+        return float(doc.width()), float(doc.height()), True, None
+
+    @staticmethod
+    def _sel_shape(sel):
+        """'round' if the selection fills clearly less than its bounding
+        box (an elliptical marquee is ~pi/4), else 'rect'. Subsampled."""
+        try:
+            w, h = int(sel.width()), int(sel.height())
+            if w <= 0 or h <= 0:
+                return "rect"
+            data = sel.pixelData(sel.x(), sel.y(), w, h)
+            if not data:
+                return "rect"
+            n = len(data)
+            step = max(1, n // 20000)
+            marked = total = 0
+            for i in range(0, n, step):
+                total += 1
+                if data[i]:
+                    marked += 1
+            frac = marked / float(total) if total else 1.0
+            return "round" if frac < 0.9 else "rect"
+        except Exception:
+            return "rect"
 
     def _opts(self):
         d = self._docker
@@ -2480,7 +2516,7 @@ class TextShapRWidget(QWidget):
                                 d.tidy_chk.isChecked())
         prepared = prepared.replace("\r\n", "\n").replace("\r", "\n")
         clean, mask = parse_bold(prepared)
-        box_w, box_h, has_doc = self._box()
+        box_w, box_h, has_doc, sel_shape = self._box()
 
         if family and clean.strip():
             measurer = _make_measurer(family,
@@ -2488,6 +2524,8 @@ class TextShapRWidget(QWidget):
                                       d.bold_chk.isChecked(),
                                       d.italic_chk.isChecked())
             mode = self._MODES[max(0, self._mode_group.checkedId())]
+            if self.auto_shape_btn.isChecked() and sel_shape == "round":
+                mode = "round"      # elliptical selection -> fit an ellipse
             try:
                 self._cands = L.shape_candidates(
                     clean, measurer, box_w, box_h,
