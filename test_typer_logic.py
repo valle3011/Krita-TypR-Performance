@@ -213,6 +213,14 @@ _wl = LO.wrap_greedy(LO.make_words("aa bb cc dd", [False] * 11),
 check("widow avoided: last line is not a lone word",
       [[w.text for w in ln] for ln in _wl] == [["aa", "bb"], ["cc", "dd"]])
 
+# group_words: regroup a flat word list at chosen break-after indices
+_gw = LO.make_words("aa bb cc dd", [False] * 11)
+check("group_words splits at break-after indices",
+      [[w.text for w in ln] for ln in LO.group_words(_gw, {1})]
+      == [["aa", "bb"], ["cc", "dd"]])
+check("group_words with no breaks -> single line",
+      len(LO.group_words(_gw, set())) == 1)
+
 _cb = LO.shape_candidates("aa bb cc dd", _measurer, 100, 100, 200, 1, 0.0,
                           mode="balanced")
 check("balanced candidates exist", len(_cb) >= 3)

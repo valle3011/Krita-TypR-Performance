@@ -312,6 +312,8 @@ LANG = {
         "shaper_wide": "Wide",
         "shaper_hyph": "Hyphenation",
         "shaper_hint": "Click a shape to test it. Shift+number applies and advances.",
+        "shaper_break_label": "Edit line breaks (click a gap):",
+        "shaper_break_tip": "Toggle a line break at this gap",
         "shaper_apply": "Apply",
         "shaper_apply_next": "Apply + next",
         "shaper_empty": ("No arrangements to show. Pick a font and make sure "
@@ -718,6 +720,8 @@ LANG = {
         "shaper_wide": "Breit",
         "shaper_hyph": "Silbentrennung",
         "shaper_hint": "Klick testet eine Form. Umschalt+Zahl fügt ein und geht weiter.",
+        "shaper_break_label": "Umbrüche bearbeiten (Lücke anklicken):",
+        "shaper_break_tip": "Zeilenumbruch an dieser Lücke umschalten",
         "shaper_apply": "Einfügen",
         "shaper_apply_next": "Einfügen + weiter",
         "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
@@ -2362,6 +2366,23 @@ class TextShapRWidget(QWidget):
         self._hint.setWordWrap(True)
         lay.addWidget(self._hint)
 
+        # Manual break editor: chips for each word with a clickable gap
+        # between them; clicking a gap toggles a line break there.
+        self._brk_box = QWidget()
+        _brk_lay = QVBoxLayout()
+        _brk_lay.setContentsMargins(0, 0, 0, 0)
+        _brk_lay.setSpacing(2)
+        self._brk_box.setLayout(_brk_lay)
+        self.lbl_break = QLabel(t("shaper_break_label"))
+        self.lbl_break.setStyleSheet("color: gray;")
+        _brk_lay.addWidget(self.lbl_break)
+        _brk_host = QWidget()
+        self._brk_flow = FlowLayout(margin=0, spacing=3)
+        _brk_host.setLayout(self._brk_flow)
+        _brk_lay.addWidget(_brk_host)
+        self._brk_box.setVisible(False)
+        lay.addWidget(self._brk_box)
+
         foot = QHBoxLayout()
         foot.addStretch(1)
         self.apply_btn = QPushButton(t("shaper_apply"))
@@ -2376,6 +2397,8 @@ class TextShapRWidget(QWidget):
         self._cards = []
         self._cands = []
         self._sel = -1
+        self._edit_words = []          # flat words of the selected cand
+        self._edit_breaks = set()      # break-after indices being edited
         self.refresh()
 
     def showEvent(self, ev):
@@ -2468,6 +2491,7 @@ class TextShapRWidget(QWidget):
         self._hint.setText(self._docker._tr(
             "shaper_hint" if has_doc else "shaper_no_doc"))
         if not have:
+            self._brk_box.setVisible(False)
             return
         o = self._opts()
         # one shared scale so the size differences between shapes stay visible
@@ -2487,6 +2511,66 @@ class TextShapRWidget(QWidget):
         self._sel = index
         for i, card in enumerate(self._cards):
             card.set_selected(i == index)
+        self._load_break_editor(index)
+
+    def _load_break_editor(self, index):
+        """Fill the break editor from the selected candidate's words."""
+        cand = self._cands[index] if 0 <= index < len(self._cands) else None
+        word_lines = cand.get("words") if cand else None
+        if not word_lines:
+            self._edit_words = []
+            self._edit_breaks = set()
+            self._brk_box.setVisible(False)
+            return
+        self._edit_words = [w for line in word_lines for w in line]
+        breaks, run = set(), 0
+        for line in word_lines[:-1]:
+            run += len(line)
+            breaks.add(run - 1)
+        self._edit_breaks = breaks
+        self._build_break_editor()
+
+    def _build_break_editor(self):
+        """(Re)build the word chips + gap toggles for the current words."""
+        while self._brk_flow.count():
+            it = self._brk_flow.takeAt(0)
+            w = it.widget() if it else None
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        words = self._edit_words
+        self._brk_box.setVisible(bool(words))
+        if not words:
+            return
+        tip = self._docker._tr("shaper_break_tip")
+        for i, wd in enumerate(words):
+            chip = QLabel(wd.text)
+            chip.setStyleSheet("padding: 0 2px;")
+            self._brk_flow.addWidget(chip)
+            if i < len(words) - 1:
+                brk = i in self._edit_breaks
+                gap = QToolButton()
+                gap.setText("\u21b5" if brk else "\u00b7")
+                gap.setToolTip(tip)
+                gap.setAutoRaise(True)
+                gap.clicked.connect(
+                    lambda _c=False, gi=i: self._toggle_break(gi))
+                self._brk_flow.addWidget(gap)
+
+    def _toggle_break(self, i):
+        if not (0 <= self._sel < len(self._cands)):
+            return
+        if i in self._edit_breaks:
+            self._edit_breaks.discard(i)
+        else:
+            self._edit_breaks.add(i)
+        word_lines = L.group_words(self._edit_words, self._edit_breaks)
+        cand = self._cands[self._sel]
+        cand["words"] = word_lines
+        cand["lines"] = [L.line_runs(g) for g in word_lines]
+        cand["k"] = len(word_lines)
+        self._cards[self._sel].update()
+        self._build_break_editor()
 
     def _apply(self, advance):
         if not (0 <= self._sel < len(self._cands)):

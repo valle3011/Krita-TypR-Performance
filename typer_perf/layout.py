@@ -99,6 +99,22 @@ def runs_text(runs):
     return "".join(t for t, _ in runs)
 
 
+def group_words(words, break_after):
+    """Split a flat word list into lines. `break_after` is a set of 0-based
+    word indices; a line ends after each such word. Used by TextShapR's manual
+    break editor to regroup a chosen candidate."""
+    lines = []
+    cur = []
+    for i, w in enumerate(words):
+        cur.append(w)
+        if i in break_after:
+            lines.append(cur)
+            cur = []
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 
 # ---------------------------------------------------------------------------
 # Hyphenation (Liang's algorithm with bundled, freely-licensed TeX patterns)
@@ -817,7 +833,10 @@ def shape_candidates(text, measurer, box_w, box_h, max_px, min_px, pad_frac,
         if key in seen:
             return
         seen.add(key)
-        cands.append({"px": px, "k": len(runs), "lines": runs})
+        # keep the word-level grouping too, so the manual break editor can
+        # regroup this candidate without re-tokenising.
+        cands.append({"px": px, "k": len(runs), "lines": runs,
+                      "words": [list(ws) for ws in word_lines]})
 
     if mode == "round":
         a, b = usable_w / 2.0, usable_h / 2.0
