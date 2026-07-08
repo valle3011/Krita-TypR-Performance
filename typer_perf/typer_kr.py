@@ -2241,7 +2241,7 @@ class ShapeCard(QFrame):
     clicked = pyqtSignal(int)
     W, H = 200, 120
 
-    def __init__(self, index, cand, opts, scale, best=False):
+    def __init__(self, index, cand, opts, scale, best=False, w=None, h=None):
         super().__init__()
         self._index = index
         self._cand = cand
@@ -2249,8 +2249,13 @@ class ShapeCard(QFrame):
         self._scale = scale
         self._selected = False
         self._best = best
-        self.setFixedSize(self.W, self.H)
+        self.setFixedSize(int(w or self.W), int(h or self.H))
         self.setCursor(Qt.PointingHandCursor)
+
+    def set_size(self, w, h, scale):
+        self._scale = scale
+        self.setFixedSize(int(w), int(h))
+        self.update()
 
     def set_selected(self, on):
         if self._selected != bool(on):
@@ -2360,7 +2365,7 @@ class TextShapRWidget(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         self.setLayout(lay)
 
-        bar = QHBoxLayout()
+        bar = FlowLayout(margin=0, spacing=4)
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
         for i, mode in enumerate(self._MODES):
@@ -2461,6 +2466,11 @@ class TextShapRWidget(QWidget):
         self._cards = []
         self._cands = []
         self._sel = -1
+        self._last_box = (1.0, 1.0)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(120)
+        self._resize_timer.timeout.connect(self._relayout_cards)
         self.refresh()
 
     def showEvent(self, ev):
@@ -2534,6 +2544,32 @@ class TextShapRWidget(QWidget):
             "shadow_dy": float(d.shadow_y_spin.value()),
         }
 
+    def _card_dims(self, box_w, box_h):
+        """Card size from the current width: wider docker = bigger cards,
+        and the height follows the bubble proportion so text is not cut."""
+        avail = max(140, self.width() - 12)
+        cols = max(1, int(avail // 210))
+        cw = max(160, min(440, int(avail / cols) - 8))
+        ratio = (box_h / float(box_w)) if box_w > 0 else 0.62
+        ch = int(max(90, min(cw * 1.7, cw * ratio)))
+        return cw, ch
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if hasattr(self, "_resize_timer"):
+            self._resize_timer.start()
+
+    def _relayout_cards(self):
+        """Resize existing cards to the new docker width (no regeneration,
+        so the selection is kept)."""
+        if not self._cards:
+            return
+        box_w, box_h = self._last_box
+        cw, ch = self._card_dims(box_w, box_h)
+        scale = min((cw - 12) / box_w, (ch - 12) / box_h)
+        for card in self._cards:
+            card.set_size(cw, ch, scale)
+
     def refresh(self):
         """Regenerate the candidates for the current line and rebuild the
         cards. Never raises; with no font/text it shows a hint instead."""
@@ -2588,10 +2624,12 @@ class TextShapRWidget(QWidget):
             self._brk_box.setVisible(False)
             return
         o = self._opts()
+        self._last_box = (box_w, box_h)
+        cw, ch = self._card_dims(box_w, box_h)
         # one shared scale so the size differences between shapes stay visible
-        scale = min((ShapeCard.W - 12) / box_w, (ShapeCard.H - 12) / box_h)
+        scale = min((cw - 12) / box_w, (ch - 12) / box_h)
         for i, cand in enumerate(self._cands):
-            card = ShapeCard(i, cand, o, scale, best=(i == 0))
+            card = ShapeCard(i, cand, o, scale, best=(i == 0), w=cw, h=ch)
             card.clicked.connect(lambda i: self._select(i, user=True))
             self._flow.addWidget(card)
             self._cards.append(card)
