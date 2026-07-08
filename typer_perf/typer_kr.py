@@ -66,6 +66,19 @@ from . import layout as L
 from . import langpair as LP
 
 
+# Human-facing version number for this build (bump on releases).
+VERSION = "1.6"
+
+# Build stamp = last-modified time of THIS installed file. copy/xcopy keep the
+# source's timestamp, so this shows which code version Krita actually loaded -
+# handy to confirm an update really took (compare it after running UPDATE.bat).
+try:
+    BUILD = time.strftime("%Y-%m-%d %H:%M",
+                          time.localtime(os.path.getmtime(__file__)))
+except Exception:
+    BUILD = "?"
+
+
 # ---------------------------------------------------------------------------
 # Wheel-safe widgets
 #
@@ -3576,6 +3589,12 @@ class TyperDocker(DockWidget):
         self.status = QLabel("")
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
+
+        # build stamp so you can see at a glance which version Krita loaded
+        self.build_lbl = QLabel("TypeR Performance v" + VERSION + " · Build " + BUILD)
+        self.build_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        self.build_lbl.setAlignment(Qt.AlignRight)
+        outer.addWidget(self.build_lbl)
 
         self.setWidget(main)
 
