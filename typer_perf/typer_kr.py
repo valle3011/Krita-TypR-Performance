@@ -329,6 +329,8 @@ LANG = {
         "shaper_break_tip": "Toggle a line break at this gap",
         "shaper_auto": "Auto shape",
         "shaper_auto_tip": "Fit an ellipse when the selection is a round bubble",
+        "shaper_live": "Live on canvas",
+        "shaper_live_tip": "Insert the picked shape onto the page as you select (replacing)",
         "shaper_apply": "Apply",
         "shaper_apply_next": "Apply + next",
         "shaper_empty": ("No arrangements to show. Pick a font and make sure "
@@ -739,6 +741,8 @@ LANG = {
         "shaper_break_tip": "Zeilenumbruch an dieser Lücke umschalten",
         "shaper_auto": "Form auto",
         "shaper_auto_tip": "Ellipse fitten, wenn die Auswahl eine runde Blase ist",
+        "shaper_live": "Live auf Leinwand",
+        "shaper_live_tip": "Gewählte Form beim Auswählen direkt auf die Seite einfügen (ersetzend)",
         "shaper_apply": "Einfügen",
         "shaper_apply_next": "Einfügen + weiter",
         "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
@@ -2361,6 +2365,13 @@ class TextShapRWidget(QWidget):
         self.auto_shape_btn.setToolTip(t("shaper_auto_tip"))
         self.auto_shape_btn.toggled.connect(lambda *_a: self.refresh())
         bar.addWidget(self.auto_shape_btn)
+        # live: insert the selected candidate onto the canvas (replacing)
+        # so you see it at the real page position; off by default.
+        self.live_btn = QPushButton(t("shaper_live"))
+        self.live_btn.setCheckable(True)
+        self.live_btn.setToolTip(t("shaper_live_tip"))
+        self.live_btn.toggled.connect(self._on_live_toggle)
+        bar.addWidget(self.live_btn)
         # hyphenation is a toggle on top of the mode, not exclusive with it
         self.hyph_btn = QPushButton(t("shaper_hyph"))
         self.hyph_btn.setCheckable(True)
@@ -2549,20 +2560,39 @@ class TextShapRWidget(QWidget):
         scale = min((ShapeCard.W - 12) / box_w, (ShapeCard.H - 12) / box_h)
         for i, cand in enumerate(self._cands):
             card = ShapeCard(i, cand, o, scale)
-            card.clicked.connect(self._select)
+            card.clicked.connect(lambda i: self._select(i, user=True))
             self._flow.addWidget(card)
             self._cards.append(card)
         self._select(0)
 
     # -- interaction --
 
-    def _select(self, index):
+    def _select(self, index, user=False):
         if not (0 <= index < len(self._cards)):
             return
         self._sel = index
         for i, card in enumerate(self._cards):
             card.set_selected(i == index)
         self._load_break_editor(index)
+        if user:
+            self._live_preview()
+
+    def _live_preview(self):
+        """When 'live' is on, insert the selected candidate onto the
+        canvas (replacing the line's previous layer) so it shows at the
+        real page position."""
+        if not (hasattr(self, "live_btn") and self.live_btn.isChecked()):
+            return
+        if 0 <= self._sel < len(self._cands):
+            try:
+                self._docker.insert_arrangement(
+                    self._cands[self._sel], False, replace=True)
+            except Exception:
+                pass
+
+    def _on_live_toggle(self, on):
+        if on:
+            self._live_preview()
 
     def _load_break_editor(self, index):
         """Fill the break editor from the selected candidate's words."""
@@ -2622,6 +2652,7 @@ class TextShapRWidget(QWidget):
         cand["k"] = len(word_lines)
         self._cards[self._sel].update()
         self._build_break_editor()
+        self._live_preview()
 
     def _apply(self, advance):
         if not (0 <= self._sel < len(self._cands)):
@@ -2647,7 +2678,7 @@ class TextShapRWidget(QWidget):
         if digit is not None:
             index = 9 if digit == 0 else digit - 1       # key 0 = card 10
             if 0 <= index < len(self._cards):
-                self._select(index)
+                self._select(index, user=True)
                 if event.modifiers() & Qt.ShiftModifier:
                     self._apply(True)
             return
@@ -5760,7 +5791,7 @@ class TyperDocker(DockWidget):
             msg += "  " + self._tr("st_replaced")
         return msg
 
-    def insert_arrangement(self, cand, advance):
+    def insert_arrangement(self, cand, advance, replace=None):
         """Insert a TextShapR candidate through the normal insert path. The
         chosen line breaks (and any hyphens) are baked into the text as hard
         breaks, and the size is capped at the candidate's px, so the layer
@@ -5796,7 +5827,8 @@ class TyperDocker(DockWidget):
             self.valign_combo.currentData() or "middle",
             self._index + 1,
             hyphenate=False,       # hyphens are already in the baked text
-            replace_existing=self.replace_chk.isChecked(),
+            replace_existing=(self.replace_chk.isChecked()
+                              if replace is None else replace),
         )
         self._set_status(self._insert_msg(key, fmt), error=not ok)
         if ok:
