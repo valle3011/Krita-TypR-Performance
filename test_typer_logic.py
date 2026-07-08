@@ -205,6 +205,14 @@ _rw = LO.fit_lines_width(_words, _measurer, 100, 100, 200, 1, 0.5)
 check("fit_lines_width narrower target -> more lines",
       _rw is not None and len(_rw[1]) >= 2 and _rw[0] > 0)
 
+# widow avoidance: a greedy wrap that would leave a lone last word pulls one
+# word down instead ([aa bb cc] / [dd]  ->  [aa bb] / [cc dd])
+_wm_wid, _wm_sp, _wm_lh, _wm_a, _wm_d = _measurer(10)
+_wl = LO.wrap_greedy(LO.make_words("aa bb cc dd", [False] * 11),
+                     _wm_wid, _wm_sp, 40.0)
+check("widow avoided: last line is not a lone word",
+      [[w.text for w in ln] for ln in _wl] == [["aa", "bb"], ["cc", "dd"]])
+
 _cb = LO.shape_candidates("aa bb cc dd", _measurer, 100, 100, 200, 1, 0.0,
                           mode="balanced")
 check("balanced candidates exist", len(_cb) >= 3)

@@ -303,10 +303,29 @@ def _split_to_fit(word, avail, width_of, hyph):
     return best
 
 
+def _fix_widows(lines, width_of, space_w, max_w):
+    """Typography polish: avoid a 'widow' - a last line holding a single word.
+    Pull the last word of the previous line down so the last line has two words,
+    but only when it still fits and the pulled word is not a hyphenation
+    left-part (which must stay glued to its continuation)."""
+    if len(lines) < 2:
+        return lines
+    last, prev = lines[-1], lines[-2]
+    if len(last) == 1 and len(prev) >= 2:
+        moved = prev[-1]
+        if not getattr(moved, "text", "").endswith("-"):
+            new_last = [moved] + last
+            if _line_width(new_last, width_of, space_w) <= max_w + 0.5:
+                lines[-2] = prev[:-1]
+                lines[-1] = new_last
+    return lines
+
+
 def wrap_greedy(words, width_of, space_w, max_w, hyph=None):
     """Greedily wrap words into lines, each line <= max_w. With `hyph` (a
     callable word -> break indices) a word that does not fit is split at a valid
-    syllable break instead of overflowing."""
+    syllable break instead of overflowing. A widow-avoidance pass keeps a lone
+    word off the last line when it can be paired without overflowing."""
     lines = [[]]
     cur_w = 0.0
     queue = list(words)
@@ -348,7 +367,7 @@ def wrap_greedy(words, width_of, space_w, max_w, hyph=None):
                 cur_w = ww
     if lines and not lines[-1]:
         lines.pop()
-    return lines
+    return _fix_widows(lines, width_of, space_w, max_w)
 
 
 def balance_even(words, width_of, space_w, usable_w, k):
