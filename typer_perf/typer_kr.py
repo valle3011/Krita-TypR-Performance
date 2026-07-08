@@ -333,6 +333,8 @@ LANG = {
         "shaper_live_tip": "Insert the picked shape onto the page as you select (replacing)",
         "shaper_best": "\u2605 Best",
         "shaper_best_tip": "Jump to the recommended arrangement (biggest that fits)",
+        "shaper_match": "Match size",
+        "shaper_match_tip": "Cap the size at the last inserted bubble, for a uniform page",
         "shaper_apply": "Apply",
         "shaper_apply_next": "Apply + next",
         "shaper_empty": ("No arrangements to show. Pick a font and make sure "
@@ -747,6 +749,8 @@ LANG = {
         "shaper_live_tip": "Gewählte Form beim Auswählen direkt auf die Seite einfügen (ersetzend)",
         "shaper_best": "\u2605 Bester",
         "shaper_best_tip": "Zur empfohlenen Anordnung springen (größte, die passt)",
+        "shaper_match": "Größe angleichen",
+        "shaper_match_tip": "Größe auf die zuletzt eingefügte Blase deckeln (einheitliche Seite)",
         "shaper_apply": "Einfügen",
         "shaper_apply_next": "Einfügen + weiter",
         "shaper_empty": ("Keine Formen anzeigbar. Erst eine Schrift wählen und "
@@ -2381,6 +2385,12 @@ class TextShapRWidget(QWidget):
         self.live_btn.setToolTip(t("shaper_live_tip"))
         self.live_btn.toggled.connect(self._on_live_toggle)
         bar.addWidget(self.live_btn)
+        # match: cap the size at the last inserted bubble for a uniform page
+        self.match_btn = QPushButton(t("shaper_match"))
+        self.match_btn.setCheckable(True)
+        self.match_btn.setToolTip(t("shaper_match_tip"))
+        self.match_btn.toggled.connect(lambda *_a: self.refresh())
+        bar.addWidget(self.match_btn)
         # hyphenation is a toggle on top of the mode, not exclusive with it
         self.hyph_btn = QPushButton(t("shaper_hyph"))
         self.hyph_btn.setCheckable(True)
@@ -2554,10 +2564,14 @@ class TextShapRWidget(QWidget):
             mode = self._MODES[max(0, self._mode_group.checkedId())]
             if self.auto_shape_btn.isChecked() and sel_shape == "round":
                 mode = "round"      # elliptical selection -> fit an ellipse
+            max_px = d.size_spin.value()
+            last = getattr(d, "_last_insert_px", None)
+            if self.match_btn.isChecked() and last:
+                max_px = min(max_px, int(last))   # match neighbouring bubbles
             try:
                 self._cands = L.shape_candidates(
                     clean, measurer, box_w, box_h,
-                    d.size_spin.value(), 6, d.pad_spin.value() / 100.0,
+                    max_px, 6, d.pad_spin.value() / 100.0,
                     mode=mode, hyphenate=self.hyph_btn.isChecked(),
                     lang=d._hyph_lang_for(clean), mask=mask, limit=10)
             except Exception:
@@ -5792,6 +5806,8 @@ class TyperDocker(DockWidget):
     def _insert_msg(self, key, fmt):
         """Status message for an insert result; notes when old layer(s) of the
         same line were replaced."""
+        if fmt.get("px"):
+            self._last_insert_px = fmt["px"]   # for TextShapR 'match size'
         msg = self._tr(key).format(**fmt)
         if fmt.get("replaced"):
             msg += "  " + self._tr("st_replaced")
