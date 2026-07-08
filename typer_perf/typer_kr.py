@@ -325,8 +325,8 @@ LANG = {
         "shaper_wide": "Wide",
         "shaper_hyph": "Hyphenation",
         "shaper_hint": "Click a shape to test it. Shift+number applies and advances.",
-        "shaper_break_label": "Edit line breaks (click a gap):",
-        "shaper_break_tip": "Toggle a line break at this gap",
+        "shaper_break_label": "Edit line breaks:",
+        "shaper_break_tip": "One line per line. Edit the breaks (or a word); the preview follows.",
         "shaper_auto": "Auto shape",
         "shaper_auto_tip": "Fit an ellipse when the selection is a round bubble",
         "shaper_live": "Live on canvas",
@@ -737,8 +737,8 @@ LANG = {
         "shaper_wide": "Breit",
         "shaper_hyph": "Silbentrennung",
         "shaper_hint": "Klick testet eine Form. Umschalt+Zahl fügt ein und geht weiter.",
-        "shaper_break_label": "Umbrüche bearbeiten (Lücke anklicken):",
-        "shaper_break_tip": "Zeilenumbruch an dieser Lücke umschalten",
+        "shaper_break_label": "Umbrüche bearbeiten:",
+        "shaper_break_tip": "Eine Zeile pro Zeile. Umbrüche (oder ein Wort) ändern; Vorschau folgt.",
         "shaper_auto": "Form auto",
         "shaper_auto_tip": "Ellipse fitten, wenn die Auswahl eine runde Blase ist",
         "shaper_live": "Live auf Leinwand",
@@ -2401,8 +2401,9 @@ class TextShapRWidget(QWidget):
         self._hint.setWordWrap(True)
         lay.addWidget(self._hint)
 
-        # Manual break editor: chips for each word with a clickable gap
-        # between them; clicking a gap toggles a line break there.
+        # Manual break editor: a plain text field showing the arrangement,
+        # one line per line. Edit the breaks (or a word) directly; the
+        # thumbnail follows and the canvas preview follows shortly after.
         self._brk_box = QWidget()
         _brk_lay = QVBoxLayout()
         _brk_lay.setContentsMargins(0, 0, 0, 0)
@@ -2411,11 +2412,16 @@ class TextShapRWidget(QWidget):
         self.lbl_break = QLabel(t("shaper_break_label"))
         self.lbl_break.setStyleSheet("color: gray;")
         _brk_lay.addWidget(self.lbl_break)
-        _brk_host = QWidget()
-        self._brk_flow = FlowLayout(margin=0, spacing=3)
-        _brk_host.setLayout(self._brk_flow)
-        _brk_lay.addWidget(_brk_host)
+        self.break_edit = QPlainTextEdit()
+        self.break_edit.setToolTip(t("shaper_break_tip"))
+        self.break_edit.setMaximumHeight(90)
+        self.break_edit.textChanged.connect(self._on_break_text_changed)
+        _brk_lay.addWidget(self.break_edit)
         self._brk_box.setVisible(False)
+        self._break_timer = QTimer(self)
+        self._break_timer.setSingleShot(True)
+        self._break_timer.setInterval(350)
+        self._break_timer.timeout.connect(self._live_preview)
         lay.addWidget(self._brk_box)
 
         foot = QHBoxLayout()
@@ -2432,8 +2438,6 @@ class TextShapRWidget(QWidget):
         self._cards = []
         self._cands = []
         self._sel = -1
-        self._edit_words = []          # flat words of the selected cand
-        self._edit_breaks = set()      # break-after indices being edited
         self.refresh()
 
     def showEvent(self, ev):
@@ -2595,64 +2599,38 @@ class TextShapRWidget(QWidget):
             self._live_preview()
 
     def _load_break_editor(self, index):
-        """Fill the break editor from the selected candidate's words."""
+        """Show the selected candidate's arrangement in the editable text
+        field (one line per line, bold as **...**)."""
         cand = self._cands[index] if 0 <= index < len(self._cands) else None
-        word_lines = cand.get("words") if cand else None
-        if not word_lines:
-            self._edit_words = []
-            self._edit_breaks = set()
+        lines = cand.get("lines") if cand else None
+        if not lines:
             self._brk_box.setVisible(False)
             return
-        self._edit_words = [w for line in word_lines for w in line]
-        breaks, run = set(), 0
-        for line in word_lines[:-1]:
-            run += len(line)
-            breaks.add(run - 1)
-        self._edit_breaks = breaks
-        self._build_break_editor()
+        text = "\n".join(L.runs_markup(runs) for runs in lines)
+        self.break_edit.blockSignals(True)
+        self.break_edit.setPlainText(text)
+        self.break_edit.blockSignals(False)
+        self._brk_box.setVisible(True)
 
-    def _build_break_editor(self):
-        """(Re)build the word chips + gap toggles for the current words."""
-        while self._brk_flow.count():
-            it = self._brk_flow.takeAt(0)
-            w = it.widget() if it else None
-            if w:
-                w.setParent(None)
-                w.deleteLater()
-        words = self._edit_words
-        self._brk_box.setVisible(bool(words))
-        if not words:
-            return
-        tip = self._docker._tr("shaper_break_tip")
-        for i, wd in enumerate(words):
-            chip = QLabel(wd.text)
-            chip.setStyleSheet("padding: 0 2px;")
-            self._brk_flow.addWidget(chip)
-            if i < len(words) - 1:
-                brk = i in self._edit_breaks
-                gap = QToolButton()
-                gap.setText("\u21b5" if brk else "\u00b7")
-                gap.setToolTip(tip)
-                gap.setAutoRaise(True)
-                gap.clicked.connect(
-                    lambda _c=False, gi=i: self._toggle_break(gi))
-                self._brk_flow.addWidget(gap)
-
-    def _toggle_break(self, i):
+    def _on_break_text_changed(self):
+        """Rebuild the selected candidate from the edited text (one line
+        per line); update the thumbnail now, the canvas preview shortly."""
         if not (0 <= self._sel < len(self._cands)):
             return
-        if i in self._edit_breaks:
-            self._edit_breaks.discard(i)
-        else:
-            self._edit_breaks.add(i)
-        word_lines = L.group_words(self._edit_words, self._edit_breaks)
+        lines = [ln for ln in self.break_edit.toPlainText().split("\n")
+                 if ln.strip()]
+        if not lines:
+            return
+        runs = []
+        for ln in lines:
+            clean, mask = parse_bold(ln)
+            runs.append(L.make_runs(clean, mask))
         cand = self._cands[self._sel]
-        cand["words"] = word_lines
-        cand["lines"] = [L.line_runs(g) for g in word_lines]
-        cand["k"] = len(word_lines)
+        cand["lines"] = runs
+        cand["k"] = len(runs)
+        cand.pop("words", None)
         self._cards[self._sel].update()
-        self._build_break_editor()
-        self._live_preview()
+        self._break_timer.start()
 
     def _apply(self, advance):
         if not (0 <= self._sel < len(self._cands)):
