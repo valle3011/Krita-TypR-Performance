@@ -462,6 +462,7 @@ LANG = {
         "exp_section": "Experimental",
         "enable_bubblr": "Enable BubblR (automatic bubble detection)",
         "enable_shapr": "Enable TextShapR",
+        "enable_sfx": "Enable SFX tab",
         "bp_hint": ("BubblR only marks the bubbles. Type the text on the "
                     "Type tab — Insert fills the current bubble and steps "
                     "to the next; ◀/▶ there redo a bubble."),
@@ -886,6 +887,7 @@ LANG = {
         "exp_section": "Experimentell",
         "enable_bubblr": "BubblR aktivieren (automatische Bubble-Erkennung)",
         "enable_shapr": "TextShapR aktivieren",
+        "enable_sfx": "SFX-Tab aktivieren",
         "bp_hint": ("BubblR markiert nur die Bubbles. Den Text schreibst du "
                     "im Type-Tab — Insert füllt die aktuelle Bubble und geht "
                     "weiter; ◀/▶ dort machen eine Bubble neu."),
@@ -3274,6 +3276,11 @@ class TyperDocker(DockWidget):
             app.readSetting("typer_perf", "enableShapr", "true") == "true")
         self.enable_shapr_chk.toggled.connect(self._on_enable_shapr)
         exp_lay.addWidget(self.enable_shapr_chk)
+        self.enable_sfx_chk = QCheckBox()
+        self.enable_sfx_chk.setChecked(
+            app.readSetting("typer_perf", "enableSfx", "true") == "true")
+        self.enable_sfx_chk.toggled.connect(self._on_enable_sfx)
+        exp_lay.addWidget(self.enable_sfx_chk)
 
         exp_lay.addWidget(self._hline())
         self.customize_chk = QCheckBox()
@@ -3722,7 +3729,11 @@ class TyperDocker(DockWidget):
         try:
             from .sfx.sfx_docker import MangaSFXDocker
             self._sfx_docker = MangaSFXDocker()
-            lay_sfx.addWidget(self._sfx_docker.widget())
+            _sfx_root = self._sfx_docker.widget()
+            # the docker wraps its content in a QScrollArea; the tab already
+            # scrolls, so host the inner content to avoid a double scrollbar.
+            _inner = _sfx_root.widget() if hasattr(_sfx_root, "widget") else None
+            lay_sfx.addWidget(_inner if _inner is not None else _sfx_root)
         except Exception as _sfx_exc:      # noqa: BLE001
             _lbl = QLabel("SFX Helper could not load:\n%s" % _sfx_exc)
             _lbl.setWordWrap(True)
@@ -3757,6 +3768,7 @@ class TyperDocker(DockWidget):
         self._tab_names = self._load_tab_names()      # id -> custom name
         # apply the TextShapR-button enable state now that the toggles exist
         self._on_enable_shapr(self.enable_shapr_chk.isChecked(), save=False)
+        self._on_enable_sfx(self.enable_sfx_chk.isChecked(), save=False)
         self._apply_tab_order(self._load_tab_order())
         self._retranslate_tabs()
         self.main_tabs.tabBar().setMovable(self.customize_chk.isChecked())
@@ -4124,6 +4136,7 @@ class TyperDocker(DockWidget):
         self._retranslate_panels()
         self.exp_toggle.setText("⚗ " + t("exp_section"))
         self.enable_shapr_chk.setText(t("enable_shapr"))
+        self.enable_sfx_chk.setText(t("enable_sfx"))
         self.customize_chk.setText(t("customize_layout"))
         self.customize_hint.setText(t("customize_hint"))
         self.layout_reset_btn.setText(t("layout_reset"))
@@ -4733,6 +4746,20 @@ class TyperDocker(DockWidget):
         if save:
             Krita.instance().writeSetting(
                 "typer_perf", "enableShapr", "true" if on else "false")
+
+    def _on_enable_sfx(self, on, save=True):
+        """Show or hide the SFX tab (kept alive when hidden)."""
+        idx = self._tab_index_of("sfx")
+        if on and idx is None:
+            page = self._tab_pages.get("sfx")
+            if page is not None:
+                i = self.main_tabs.addTab(page, self._tab_label("sfx"))
+                self.main_tabs.tabBar().setTabData(i, "sfx")
+        elif not on and idx is not None:
+            self.main_tabs.removeTab(idx)
+        if save:
+            Krita.instance().writeSetting(
+                "typer_perf", "enableSfx", "true" if on else "false")
 
     def on_layout_reset(self):
         """Back to the built-in tab names/order AND panel homes (unpin
