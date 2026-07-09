@@ -309,6 +309,7 @@ LANG = {
         "tab_presets": "Presets",
         "tab_setup": "Setup",
         "tab_shapr": "TextShapR",
+        "tab_sfx": "SFX",
         "close": "Close",
         "preset_actions": "Preset actions (save, delete, import, export)",
         "outline_more": "Outline settings …",
@@ -724,6 +725,7 @@ LANG = {
         "tab_presets": "Presets",
         "tab_setup": "Einstellungen",
         "tab_shapr": "TextShapR",
+        "tab_sfx": "SFX",
         "close": "Schließen",
         "preset_actions": "Preset-Aktionen (speichern, löschen, importieren, exportieren)",
         "outline_more": "Kontur-Einstellungen …",
@@ -3142,6 +3144,7 @@ class TyperDocker(DockWidget):
         lay_style = _page()      # font variants, alignment, effects, fitting
         lay_setup = _page()      # language + panel layout
         lay_shapr = _page()      # TextShapR: pick a shape arrangement
+        lay_sfx = _page()        # SFX Helper (embedded MangaSFX docker)
 
         # Presets are no longer their own tab: they live inside the Type
         # tab as a self-contained panel container. Building them into this
@@ -3712,6 +3715,20 @@ class TyperDocker(DockWidget):
         self.shapr_widget = TextShapRWidget(self)
         lay_shapr.addWidget(self.shapr_widget)
 
+        # --- SFX tab (embed the MangaSFX docker's widget as a tab) ---
+        # Defensive: a failure to build the SFX panel must never take TypeR down;
+        # on error the tab just shows a short note instead.
+        self._sfx_docker = None
+        try:
+            from .sfx.sfx_docker import MangaSFXDocker
+            self._sfx_docker = MangaSFXDocker()
+            lay_sfx.addWidget(self._sfx_docker.widget())
+        except Exception as _sfx_exc:      # noqa: BLE001
+            _lbl = QLabel("SFX Helper could not load:\n%s" % _sfx_exc)
+            _lbl.setWordWrap(True)
+            _lbl.setStyleSheet("color: gray;")
+            lay_sfx.addWidget(_lbl)
+
         # status line below the tabs, always visible
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -3731,7 +3748,8 @@ class TyperDocker(DockWidget):
         # order are persisted; the panel-level drag/detach comes in a later
         # phase and builds on layoutmodel.py.
         self._tab_defaults = [("type", "tab_type"), ("style", "tab_style"),
-                              ("setup", "tab_setup"), ("shapr", "tab_shapr")]
+                              ("setup", "tab_setup"), ("shapr", "tab_shapr"),
+                              ("sfx", "tab_sfx")]
         self._tab_pages = {}          # id -> tab page widget (kept when hidden)
         for i, (tid, _nk) in enumerate(self._tab_defaults):
             self.main_tabs.tabBar().setTabData(i, tid)
