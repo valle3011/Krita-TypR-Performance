@@ -25,6 +25,7 @@ PANELS = (
     "font_picker", "color_pick", "presets", "live_preview",
     "style_basic", "style_size", "style_outline", "style_shadow",
     "hyphenation",
+    "shapr_panel", "sfx_panel",
     "setup_general", "layout_sizes",
 )
 
@@ -37,6 +38,8 @@ DEFAULT_TABS = (
     ("style", "tab_style", ["style_basic", "style_size", "style_outline",
                             "style_shadow", "hyphenation"]),
     ("setup", "tab_setup", ["setup_general", "layout_sizes"]),
+    ("shapr", "tab_shapr", ["shapr_panel"]),
+    ("sfx", "tab_sfx", ["sfx_panel"]),
 )
 
 # how many generic host dockers are pre-registered for detached panels

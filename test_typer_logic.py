@@ -372,18 +372,20 @@ check("rename_tab", _panels_of(_rn, "type") is not None and
       [t for t in _rn["tabs"] if t["id"] == "type"][0]["name"] == "Main")
 _at, _nid = LM.add_tab(_d, "Extra")
 check("add_tab: new empty tab appended",
-      _panels_of(_at, _nid) == [] and len(_at["tabs"]) == 4)
+      _panels_of(_at, _nid) == [] and len(_at["tabs"]) == 6)
 _rm = LM.remove_tab(_d, "style")
 check("remove_tab: tab gone, panels rehomed not lost",
       all(t["id"] != "style" for t in _rm["tabs"]) and
       sorted(LM.all_placed_panels(_rm)) == sorted(LM.PANELS))
 _one = LM.default_layout()
-_one = LM.remove_tab(LM.remove_tab(_one, "style"), "setup")
+_one = LM.remove_tab(LM.remove_tab(LM.remove_tab(
+    LM.remove_tab(_one, "style"), "setup"), "shapr"), "sfx")
 check("remove_tab: refuses to delete the last tab",
       len(LM.remove_tab(_one, "type")["tabs"]) == 1)
 _ord = LM.reorder_tabs(_d, ["setup", "style"])
 check("reorder_tabs: listed first, rest appended in order",
-      [t["id"] for t in _ord["tabs"]] == ["setup", "style", "type"])
+      [t["id"] for t in _ord["tabs"]]
+      == ["setup", "style", "type", "shapr", "sfx"])
 
 # detach / reattach round trip
 _det = LM.detach(_d, ["style_outline"], 0)

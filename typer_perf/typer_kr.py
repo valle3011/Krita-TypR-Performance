@@ -458,6 +458,8 @@ LANG = {
         "panel_bubblr_detect": "Detection",
         "panel_bubblr_overlay": "Bubble preview",
         "panel_setup_general": "General",
+        "panel_shapr": "TextShapR",
+        "panel_sfx": "SFX Helper",
         "panel_layout_sizes": "Layout & sizes",
         "exp_section": "Experimental",
         "enable_bubblr": "Enable BubblR (automatic bubble detection)",
@@ -883,6 +885,8 @@ LANG = {
         "panel_bubblr_detect": "Erkennung",
         "panel_bubblr_overlay": "Bubble-Vorschau",
         "panel_setup_general": "Allgemein",
+        "panel_shapr": "TextShapR",
+        "panel_sfx": "SFX Helper",
         "panel_layout_sizes": "Layout & Größen",
         "exp_section": "Experimentell",
         "enable_bubblr": "BubblR aktivieren (automatische Bubble-Erkennung)",
@@ -3160,7 +3164,8 @@ class TyperDocker(DockWidget):
 
         # movable-panel registry (customizable layout, step 2a)
         self._tab_layouts = {"type": lay_type, "style": lay_style,
-                             "setup": lay_setup}
+                             "setup": lay_setup, "shapr": lay_shapr,
+                             "sfx": lay_sfx}
         self._panels = {}          # panel id -> PanelBox
         self._panel_tab = {}       # panel id -> current tab id
         self._panel_home = {}      # panel id -> default (home) tab id
@@ -3718,14 +3723,17 @@ class TyperDocker(DockWidget):
         lay_style.addWidget(_hy_pb)
         lay_style.addStretch(1)
 
-        # --- TextShapR tab (pick a shape arrangement for the current line) ---
+        # --- TextShapR tab (a movable panel, so it joins the custom layout) ---
         self.shapr_widget = TextShapRWidget(self)
-        lay_shapr.addWidget(self.shapr_widget)
+        _shapr_pb = self._new_panel("shapr_panel", "shapr")
+        _shapr_pb.body_layout().addWidget(self.shapr_widget)
+        lay_shapr.addWidget(_shapr_pb)
 
-        # --- SFX tab (embed the MangaSFX docker's widget as a tab) ---
+        # --- SFX tab (embed the MangaSFX docker in a movable panel) ---
         # Defensive: a failure to build the SFX panel must never take TypeR down;
-        # on error the tab just shows a short note instead.
+        # on error the panel just shows a short note instead.
         self._sfx_docker = None
+        _sfx_pb = self._new_panel("sfx_panel", "sfx")
         try:
             from .sfx.sfx_docker import MangaSFXDocker
             self._sfx_docker = MangaSFXDocker()
@@ -3733,12 +3741,14 @@ class TyperDocker(DockWidget):
             # the docker wraps its content in a QScrollArea; the tab already
             # scrolls, so host the inner content to avoid a double scrollbar.
             _inner = _sfx_root.widget() if hasattr(_sfx_root, "widget") else None
-            lay_sfx.addWidget(_inner if _inner is not None else _sfx_root)
+            _sfx_pb.body_layout().addWidget(
+                _inner if _inner is not None else _sfx_root)
         except Exception as _sfx_exc:      # noqa: BLE001
             _lbl = QLabel("SFX Helper could not load:\n%s" % _sfx_exc)
             _lbl.setWordWrap(True)
             _lbl.setStyleSheet("color: gray;")
-            lay_sfx.addWidget(_lbl)
+            _sfx_pb.body_layout().addWidget(_lbl)
+        lay_sfx.addWidget(_sfx_pb)
 
         # status line below the tabs, always visible
         self.status = QLabel("")
@@ -4298,7 +4308,9 @@ class TyperDocker(DockWidget):
                      "style_shadow": "panel_style_shadow",
                      "hyphenation": "panel_hyphenation",
                      "setup_general": "panel_setup_general",
-                     "layout_sizes": "panel_layout_sizes"}
+                     "layout_sizes": "panel_layout_sizes",
+                     "shapr_panel": "panel_shapr",
+                     "sfx_panel": "panel_sfx"}
 
     def _new_panel(self, pid, tab_id):
         """Create a PanelBox for panel `pid`, initially living in `tab_id`.
